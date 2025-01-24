@@ -68,14 +68,14 @@ def convert_pcm_to_opus_in_memory(input_data) -> io.BytesIO:
     except Exception as e:
         raise RuntimeError(f"Unexpected error: {e}") from e
 
-@app.post("/status")
+@app.get("/status")
 def status():
     """
     Endpoint to check the service status.
     """
     return {"version": f"Bazarr to OpenAI Whisper Bridge ({docker_status}) v{version}"}
 
-@app.get("/detect-language")
+@app.post("/detect-language")
 def detect_language():
     return {"detected_language": "Forced from WhisperBridge", "language_code": force_detected_language_to}
     
