@@ -1,4 +1,4 @@
-version = '0.1'
+version = '0.2'
 
 import os
 import io
@@ -16,9 +16,11 @@ import uvicorn
 in_docker = os.path.exists("/.dockerenv")
 docker_status = "Docker" if in_docker else "Standalone"
 
-# Initialize FastAPI
+# Initialize FastAPI & OpenAI Client
 app = FastAPI()
 client = OpenAI()
+
+force_detected_language_to = os.getenv('FORCE_DETECTED_LANGUAGE_TO', 'en')
 
 def convert_pcm_to_opus_in_memory(input_data) -> io.BytesIO:
     """
@@ -73,6 +75,10 @@ def status():
     """
     return {"version": f"Bazarr to OpenAI Whisper Bridge ({docker_status}) v{version}"}
 
+@app.get("/detect-language")
+def detect_language():
+    return {"detected_language": "Forced from WhisperBridge", "language_code": force_detected_language_to}
+    
 @app.post("/asr")
 async def asr(
     task: Union[str, None] = Query(default="transcribe", enum=["transcribe", "translate"]),
