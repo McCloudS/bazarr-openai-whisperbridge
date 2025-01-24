@@ -68,7 +68,7 @@ def convert_pcm_to_opus_in_memory(input_data) -> io.BytesIO:
     except Exception as e:
         raise RuntimeError(f"Unexpected error: {e}") from e
 
-@app.get("/status")
+@app.post("/status")
 def status():
     """
     Endpoint to check the service status.
