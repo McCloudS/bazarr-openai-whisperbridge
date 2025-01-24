@@ -14,9 +14,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Set the working directory in the container
 WORKDIR /app
 
-# Copy the application script into the container
-COPY bazarr-openai-whisperbridge.py /app/
-
 # Install Python dependencies directly with pip
 RUN pip install --no-cache-dir \
     fastapi \
@@ -24,6 +21,9 @@ RUN pip install --no-cache-dir \
     python-multipart \
     ffmpeg-python \
     openai
+
+# Copy the application script into the container
+COPY bazarr-openai-whisperbridge.py /app/
 
 # Command to run the app
 CMD ["python", "bazarr-openai-whisperbridge.py"]
