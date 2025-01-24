@@ -77,7 +77,8 @@ def status():
 
 @app.post("/detect-language")
 def detect_language():
-    return {"detected_language": "Forced from WhisperBridge", "language_code": force_detected_language_to}
+    print(f"Forced detected language to {force_detected_language_to}")
+    return {"detected_language": f"Forced to {force_detected_language_to} from WhisperBridge", "language_code": force_detected_language_to}
     
 @app.post("/asr")
 async def asr(
