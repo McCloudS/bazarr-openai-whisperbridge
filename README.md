@@ -1,5 +1,5 @@
 # bazarr-openai-whisperbridge
-A bridge to user Bazarr's Whisper provider with OpenAI formatted providers
+A bridge to use Bazarr's Whisper provider with OpenAI formatted providers.
 
 ### How to use:
 Configure in Bazarr the same as a regular Whisper provider.
@@ -17,6 +17,6 @@ Download the .py script, set the environment variables above, and have ffmpeg in
 | FORCE_DETECTED_LANGUAGE_TO | 'en' | If detect_language is called from Bazarr's Whisper provider, it will return this language, must be a ISO 639-1 letter code |
 
 # Caveats/Notes
-* OpenAI's Whisper endpoint can only take 25mb files.  This attempts to convert the WAV to a more compressed OPUS file to combat that.  You will still run into this issue on large/long files (probably > 90 minutes).  This issue won't exist on other providers.
+* OpenAI's Whisper endpoint can only take 25mb files.  This attempts to convert the WAV to a more compressed Opus codec to combat that.  You will still run into this issue on large/long files (probably > 90 minutes).  This issue won't exist on other providers.
 
 * OpenAI's endpoint does not have a detect language equivalent, so we have to force it to what we want or it will default to return English.
