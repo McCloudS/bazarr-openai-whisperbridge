@@ -1,15 +1,13 @@
 # Use the official Python image as the base
-FROM python:3.11-slim
+FROM python:3.11-alpine
 
 # Set environment variables to ensure Python behaves as expected
 ENV PYTHONDONTWRITEBYTECODE 1  # Prevent Python from writing .pyc files
 ENV PYTHONUNBUFFERED 1        # Ensure logs are shown in real time
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache \
+    ffmpeg
 
 # Set the working directory in the container
 WORKDIR /app
