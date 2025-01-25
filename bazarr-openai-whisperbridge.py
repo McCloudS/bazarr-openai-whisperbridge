@@ -21,6 +21,7 @@ app = FastAPI()
 client = OpenAI()
 
 force_detected_language_to = os.getenv('FORCE_DETECTED_LANGUAGE_TO', 'en')
+whisper_model = os.getenv('WHISPER_MODEL', 'whisper-1')
 
 def convert_pcm_to_opus_in_memory(input_data) -> io.BytesIO:
     """
@@ -108,7 +109,7 @@ async def asr(
         if task == "transcribe":
             print("Got a transcribe task from Bazarr")
             response = client.audio.transcriptions.create(
-                model="whisper-1",
+                model=whisper_model,
                 file=opus_data,
                 response_format="srt",
                 language=language,
@@ -116,7 +117,7 @@ async def asr(
         else:
             print("Got a translate task from Bazarr")
             response = client.audio.translations.create(
-                model="whisper-1",
+                model=whisper_model,
                 file=opus_data,
                 response_format="srt",
             )
@@ -139,5 +140,5 @@ async def asr(
 
 
 if __name__ == "__main__":
-    print(f"Running Bazarr to OpenAI Whisper Bridge ({docker_status}) v{version}") 
+    print(f"Running Bazarr to OpenAI Whisper Bridge ({docker_status}) v{version} using model: {whisper_model}") 
     uvicorn.run(app, host="0.0.0.0", port=9000)
