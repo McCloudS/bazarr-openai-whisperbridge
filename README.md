@@ -15,6 +15,7 @@ Download the .py script, set the environment variables above, and have ffmpeg in
 | OPENAI_API_KEY         | ''        | Required for all providers |
 | OPENAI_BASE_URL | '' | Optional if you want a custom provider, otherwise the OpenAI client defaults it to OpenAI's endpoint |
 | FORCE_DETECTED_LANGUAGE_TO | 'en' | If detect_language is called from Bazarr's Whisper provider, it will return this language, must be a ISO 639-1 letter code |
+| WHISPER_MODEL | 'whisper-1' | Default model used by OpenAI, can only be set if you are using a custom provider that supports it |
 
 # Caveats/Notes
 * OpenAI's Whisper endpoint can only take 25mb files.  This attempts to convert the WAV to a more compressed Opus codec to combat that.  You will still run into this issue on large/long files (probably > 90 minutes).  This issue won't exist on other providers.
