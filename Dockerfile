@@ -10,17 +10,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 RUN pip install --no-cache-dir \
-    torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-
-RUN pip install --no-cache-dir \
     fastapi \
     uvicorn \
     python-multipart \
     ffmpeg-python \
-    openai \
-    numpy \
-    stable-ts-whisperless
+    openai
 
 COPY bazarr-openai-whisperbridge.py /app/
-
 CMD ["python", "bazarr-openai-whisperbridge.py"]
