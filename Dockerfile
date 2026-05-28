@@ -8,8 +8,8 @@ RUN apk add --no-cache ffmpeg
 WORKDIR /app
 
 RUN pip install --no-cache-dir \
-    torch==2.6.0 \
-    torchaudio==2.6.0 \
+    torch==2.10.0 \
+    torchaudio==2.10.0 \
     --index-url https://download.pytorch.org/whl/cpu
 
 RUN pip install --no-cache-dir \
