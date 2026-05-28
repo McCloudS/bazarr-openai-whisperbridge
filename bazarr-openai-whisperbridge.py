@@ -1,4 +1,4 @@
-version = '0.98'
+version = '0.99'
 
 import os
 import io
@@ -25,29 +25,14 @@ MAX_UPLOAD_BYTES = int(os.getenv('MAX_UPLOAD_MB', '24')) * 1024 * 1024
 OPUS_BITRATE_BPS = int(os.getenv('OPUS_BITRATE_KBPS', '24')) * 1000
 OPUS_APPLICATION = "audio"
 
+# Maximum characters per subtitle line. Lines longer than this are split at
+# the nearest word boundary using the word-level timestamps from the API.
+MAX_LINE_LENGTH  = int(os.getenv('MAX_LINE_LENGTH', '42'))
+
 PCM_SAMPLE_RATE      = 16000
 PCM_NUM_CHANNELS     = 1
 PCM_BITS_PER_SAMPLE  = 16
 PCM_BYTES_PER_SAMPLE = PCM_BITS_PER_SAMPLE // 8
-
-# Stable-ts regroup algorithm string.
-# Controls how word-level timestamps are grouped into subtitle segments.
-# Requires stable-ts-whisperless to be installed; skipped silently if not.
-#
-# Default mirrors subgen: clamp_max + split_by_length(84) + split_by_length(42).
-# Set to blank to use stable-ts's own default (punctuation + gap based).
-# See https://github.com/jianfch/stable-ts for the full string syntax.
-REGROUP_ALGO = os.getenv('REGROUP', 'cm_sl=84_sl=42++++++1')
-
-# ---------------------------------------------------------------------------
-# Optional stable-ts import
-# pip install stable-ts-whisperless (also requires torch CPU)
-# ---------------------------------------------------------------------------
-try:
-    import stable_whisper
-    _stable_ts_available = True
-except ImportError:
-    _stable_ts_available = False
 
 
 # ---------------------------------------------------------------------------
@@ -64,22 +49,22 @@ def seconds_to_srt_timestamp(seconds: float) -> str:
 
 def verbose_json_to_segments(response) -> list[dict]:
     """
-    Extract segments from a verbose_json response, including word-level timestamps.
+    Extract segments from a verbose_json response.
 
-    Prefers top-level words (Groq format) over segment-nested words (OpenAI format).
-    When top-level words are present, we build a single synthetic segment covering
-    the full audio and attach all words to it — stable-ts regroup then handles all
-    the actual segmentation, so we're not constrained by the provider's boundaries.
+    Handles two provider formats:
+      - Groq:   words in a top-level response.words array
+      - OpenAI: words nested inside each segment object
 
-    Falls back to segment-level words or plain segments if neither is available.
+    When top-level words are present we ignore the provider's segment
+    boundaries and rebuild segments ourselves using split_segments(), giving
+    us precise word-boundary splits at the desired line length.
     """
-    # --- prefer top-level words (Groq) ---
+    # --- Groq: top-level words array ---
     top_words = [
         {
-            "word":  getattr(w, "word",  ""),
+            "word":  getattr(w, "word",  "").strip(),
             "start": getattr(w, "start", None),
             "end":   getattr(w, "end",   None),
-            "score": getattr(w, "probability", 1.0),
         }
         for w in (getattr(response, "words", None) or [])
         if getattr(w, "start", None) is not None
@@ -87,22 +72,10 @@ def verbose_json_to_segments(response) -> list[dict]:
     ]
     if top_words:
         top_words.sort(key=lambda w: w["start"])
-        # stable-ts reconstructs segment text by concatenating word tokens.
-        # Whisper tokens normally include a leading space (" Hello"), but Groq
-        # returns bare words ("Hello"). Add the space so joined text reads correctly.
-        for i, w in enumerate(top_words):
-            if i > 0 and not w["word"].startswith(" "):
-                w["word"] = " " + w["word"]
-        full_text = (getattr(response, "text", "") or "").strip()
-        print(f"Using {len(top_words)} top-level words for regroup.")
-        return [{
-            "start": top_words[0]["start"],
-            "end":   top_words[-1]["end"],
-            "text":  full_text,
-            "words": top_words,
-        }]
+        print(f"Using {len(top_words)} top-level words — splitting into segments.")
+        return split_segments(top_words)
 
-    # --- fall back to segment-nested words (OpenAI) or plain segments ---
+    # --- OpenAI: segment-nested words ---
     raw_segments = getattr(response, "segments", None) or []
     segments = []
     for seg in raw_segments:
@@ -111,22 +84,62 @@ def verbose_json_to_segments(response) -> list[dict]:
         text  = (getattr(seg, "text", "") or "").strip()
         if start is None or end is None:
             continue
-        s = {"start": start, "end": end, "text": text}
-        words = getattr(seg, "words", None)
+        words = [
+            {
+                "word":  getattr(w, "word", "").strip(),
+                "start": w.start,
+                "end":   w.end,
+            }
+            for w in (getattr(seg, "words", None) or [])
+            if getattr(w, "start", None) is not None
+            and getattr(w, "end",   None) is not None
+        ]
         if words:
-            s["words"] = [
-                {
-                    "word":  getattr(w, "word", ""),
-                    "start": w.start,
-                    "end":   w.end,
-                    "score": getattr(w, "probability", 1.0),
-                }
-                for w in words
-                if getattr(w, "start", None) is not None
-                and getattr(w, "end",   None) is not None
-            ]
-        segments.append(s)
+            segments.extend(split_segments(words))
+        else:
+            segments.append({"start": start, "end": end, "text": text})
     return segments
+
+
+def split_segments(words: list[dict]) -> list[dict]:
+    """
+    Group a flat list of word dicts into subtitle segments, splitting when
+    the accumulated line would exceed MAX_LINE_LENGTH characters.
+
+    Each segment's start/end is taken directly from the word timestamps so
+    the subtitle appears exactly when the first word is spoken and disappears
+    when the last word ends — no padding, no silence bleed.
+    """
+    segments = []
+    current_words: list[dict] = []
+    current_len = 0
+
+    for word in words:
+        w_text = word["word"]
+        # +1 for the space between words (except the first word)
+        added = len(w_text) + (1 if current_words else 0)
+
+        if current_words and current_len + added > MAX_LINE_LENGTH:
+            # Flush current segment
+            segments.append(_words_to_segment(current_words))
+            current_words = [word]
+            current_len   = len(w_text)
+        else:
+            current_words.append(word)
+            current_len += added
+
+    if current_words:
+        segments.append(_words_to_segment(current_words))
+
+    return segments
+
+
+def _words_to_segment(words: list[dict]) -> dict:
+    return {
+        "start": words[0]["start"],
+        "end":   words[-1]["end"],
+        "text":  " ".join(w["word"] for w in words),
+    }
 
 
 def segments_to_srt(segments: list[dict]) -> str:
@@ -138,77 +151,6 @@ def segments_to_srt(segments: list[dict]) -> str:
             f"{seg['text']}\n"
         )
     return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# stable-ts regrouping
-# ---------------------------------------------------------------------------
-
-def regroup_segments(segments: list[dict]) -> list[dict]:
-    """
-    Use stable-ts to regroup word-level timestamps into natural subtitle
-    segments using the REGROUP algorithm string.
-
-    Only runs when:
-      - stable-ts-whisperless is installed
-      - The segments contain word-level data (from timestamp_granularities)
-      - REGROUP is not set to an empty string
-
-    Falls back to the input segments on any error.
-    """
-    if not _stable_ts_available:
-        print("Regroup: stable-ts not installed — skipping.")
-        return segments
-
-    has_words = any(seg.get("words") for seg in segments)
-    if not has_words:
-        print("Regroup: no word-level data in segments — skipping.")
-        return segments
-
-    if not REGROUP_ALGO:
-        regroup_arg = True   # use stable-ts default
-    else:
-        regroup_arg = REGROUP_ALGO
-
-    before = len(segments)
-    try:
-        result = stable_whisper.WhisperResult(
-            {
-                "segments": [
-                    {
-                        "start": seg["start"],
-                        "end":   seg["end"],
-                        "text":  seg["text"],
-                        "words": [
-                            {
-                                "word":        w.get("word", ""),
-                                "start":       w.get("start"),
-                                "end":         w.get("end"),
-                                "probability": w.get("score", 1.0),
-                            }
-                            for w in (seg.get("words") or [])
-                            if w.get("start") is not None and w.get("end") is not None
-                        ],
-                    }
-                    for seg in segments
-                ]
-            },
-            check_sorted=False,
-        )
-        result.regroup(regroup_arg)
-        regrouped = [
-            {"start": seg.start, "end": seg.end, "text": seg.text.strip()}
-            for seg in result.segments
-        ]
-        after = len(regrouped)
-        print(f"Regroup: {before} segments → {after} segments (algo: {regroup_arg!r})")
-        return regrouped
-    except Exception as exc:
-        print(f"Regroup failed ({exc}) — using original {before} segments.")
-        return [
-            {"start": s["start"], "end": s["end"], "text": s["text"]}
-            for s in segments
-        ]
 
 
 # ---------------------------------------------------------------------------
@@ -287,10 +229,7 @@ def split_pcm_into_chunks(pcm_bytes: bytes, num_chunks: int) -> list[tuple[bytes
 # ---------------------------------------------------------------------------
 
 def _call_api(opus: io.BytesIO, task: str, language: str | None) -> list[dict]:
-    """
-    Call the provider with verbose_json + word-level timestamps.
-    Returns segments including word data when the provider supports it.
-    """
+    """Call the provider with verbose_json + word timestamps. Returns segments."""
     opus.seek(0)
     if task == "transcribe":
         response = client.audio.transcriptions.create(
@@ -314,12 +253,11 @@ def _transcribe_pcm_chunks(
     task: str,
     language: str | None,
 ) -> str:
-    """Encode each PCM chunk, transcribe, regroup, apply offset, merge to SRT."""
+    """Encode each PCM chunk, transcribe, apply sample-accurate offset, merge to SRT."""
     all_segments: list[dict] = []
     for idx, (pcm_chunk, start_offset) in enumerate(pcm_chunks, start=1):
         print(f"Transcribing chunk {idx}/{len(pcm_chunks)} (offset={start_offset:.3f}s) ...")
         segs = _call_api(encode_pcm_to_opus(pcm_chunk), task, language)
-        segs = regroup_segments(segs)
         for seg in segs:
             seg["start"] += start_offset
             seg["end"]   += start_offset
@@ -338,9 +276,7 @@ def call_transcription(pcm_bytes: bytes, task: str, language: str | None) -> str
 
     if opus_size <= MAX_UPLOAD_BYTES:
         try:
-            segs = _call_api(opus, task, language)
-            segs = regroup_segments(segs)
-            return segments_to_srt(segs)
+            return segments_to_srt(_call_api(opus, task, language))
         except Exception as exc:
             if not is_too_large_error(exc):
                 raise
@@ -412,12 +348,11 @@ def asr(
 
 
 if __name__ == "__main__":
-    regroup_status = f"regroup: {REGROUP_ALGO or 'stable-ts default'}" if _stable_ts_available else "stable-ts not installed"
     print(
         f"Running Bazarr to OpenAI Whisper Bridge ({docker_status}) v{version} | "
         f"model: {whisper_model} | "
         f"opus: {OPUS_BITRATE_BPS // 1000} kbps | "
         f"max upload: {MAX_UPLOAD_BYTES // 1024 // 1024} MB | "
-        f"{regroup_status}"
+        f"max line: {MAX_LINE_LENGTH} chars"
     )
     uvicorn.run(app, host="0.0.0.0", port=9000)
