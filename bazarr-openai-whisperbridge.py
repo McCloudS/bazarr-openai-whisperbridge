@@ -1,4 +1,4 @@
-version = '0.8'
+version = '0.9'
 
 import os
 import io
@@ -109,7 +109,7 @@ def refine_segments(segments: list[dict], pcm_bytes: bytes) -> list[dict]:
             ]
         })
         audio = np.frombuffer(pcm_bytes, np.int16).astype(np.float32) / 32768.0
-        result.suppress_silence(audio, sr=PCM_SAMPLE_RATE)
+        result.suppress_silence(audio)
         return [
             {"start": seg.start, "end": seg.end, "text": seg.text}
             for seg in result.segments
@@ -209,40 +209,33 @@ def _call_api(opus: io.BytesIO, task: str, language: str | None, fmt: str):
         )
 
 
-def _probe_provider(opus: io.BytesIO, task: str, language: str | None) -> None:
-    """
-    Probe the provider once to determine srt vs verbose_json support and cache
-    the result. Safe to call from multiple threads — only one probe fires.
-    """
-    global _provider_supports_srt
-
-    if _provider_supports_srt is not None:
-        return
-
-    with _provider_lock:
-        if _provider_supports_srt is not None:
-            return
-        try:
-            _call_api(opus, task, language, "srt")
-            _provider_supports_srt = True
-            print("Provider supports response_format=srt — caching for future requests.")
-        except BadRequestError as exc:
-            if not is_format_rejection(exc):
-                raise
-            print(
-                f"Provider rejected response_format=srt ({exc}). "
-                "Using verbose_json — caching for future requests."
-            )
-            _provider_supports_srt = False
-
-
 def _transcribe_to_segments(opus: io.BytesIO, task: str, language: str | None) -> list[dict]:
     """
     Transcribe one Opus file and return segments as a list of dicts.
     Always uses verbose_json so callers can post-process timestamps.
-    Sets _provider_supports_srt as a side-effect on the first call.
+
+    On the very first call, probes the provider under lock to determine srt vs
+    verbose_json support. The probe result is cached so all subsequent calls
+    skip the lock entirely. Only one probe ever fires across all threads.
     """
-    _probe_provider(opus, task, language)
+    global _provider_supports_srt
+
+    if _provider_supports_srt is None:
+        with _provider_lock:
+            if _provider_supports_srt is None:
+                try:
+                    _call_api(opus, task, language, "srt")
+                    _provider_supports_srt = True
+                    print("Provider supports response_format=srt — caching for future requests.")
+                except BadRequestError as exc:
+                    if not is_format_rejection(exc):
+                        raise
+                    print(
+                        f"Provider rejected response_format=srt ({exc}). "
+                        "Using verbose_json — caching for future requests."
+                    )
+                    _provider_supports_srt = False
+
     return verbose_json_to_segments(_call_api(opus, task, language, "verbose_json"))
 
 
@@ -250,8 +243,28 @@ def _transcribe_single(opus: io.BytesIO, task: str, language: str | None) -> str
     """
     Transcribe a single Opus file and return an SRT string.
     Uses the provider's native srt format when supported (no stable-ts path).
+
+    On the very first call, probes under lock and returns the probe response
+    directly — no wasted round trip.
     """
-    _probe_provider(opus, task, language)
+    global _provider_supports_srt
+
+    if _provider_supports_srt is None:
+        with _provider_lock:
+            if _provider_supports_srt is None:
+                try:
+                    response = _call_api(opus, task, language, "srt")
+                    _provider_supports_srt = True
+                    print("Provider supports response_format=srt — caching for future requests.")
+                    return response  # reuse the probe response directly
+                except BadRequestError as exc:
+                    if not is_format_rejection(exc):
+                        raise
+                    print(
+                        f"Provider rejected response_format=srt ({exc}). "
+                        "Using verbose_json — caching for future requests."
+                    )
+                    _provider_supports_srt = False
 
     if _provider_supports_srt:
         return _call_api(opus, task, language, "srt")
