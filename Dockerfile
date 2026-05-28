@@ -1,16 +1,16 @@
-FROM python:3.11-alpine
+FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-RUN apk add --no-cache ffmpeg
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 RUN pip install --no-cache-dir \
-    torch==2.10.0 \
-    torchaudio==2.10.0 \
-    --index-url https://download.pytorch.org/whl/cpu
+    torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 
 RUN pip install --no-cache-dir \
     fastapi \
