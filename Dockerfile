@@ -12,6 +12,8 @@ RUN apk add --no-cache \
 # Set the working directory in the container
 WORKDIR /app
 
+RUN pip install torch --index-url https://download.pytorch.org/whl/cpu --no-cache-dir
+
 # Install Python dependencies directly with pip
 RUN pip install --no-cache-dir \
     fastapi \
