@@ -123,9 +123,12 @@ def regroup_segments(segments: list[dict]) -> list[dict]:
     Falls back to the input segments on any error.
     """
     if not _stable_ts_available:
+        print("Regroup: stable-ts not installed — skipping.")
         return segments
 
-    if not any(seg.get("words") for seg in segments):
+    has_words = any(seg.get("words") for seg in segments)
+    if not has_words:
+        print("Regroup: no word-level data in segments — skipping.")
         return segments
 
     if not REGROUP_ALGO:
@@ -133,6 +136,7 @@ def regroup_segments(segments: list[dict]) -> list[dict]:
     else:
         regroup_arg = REGROUP_ALGO
 
+    before = len(segments)
     try:
         result = stable_whisper.WhisperResult({
             "segments": [
@@ -155,12 +159,15 @@ def regroup_segments(segments: list[dict]) -> list[dict]:
             ]
         })
         result.regroup(regroup_arg)
-        return [
+        regrouped = [
             {"start": seg.start, "end": seg.end, "text": seg.text.strip()}
             for seg in result.segments
         ]
+        after = len(regrouped)
+        print(f"Regroup: {before} segments → {after} segments (algo: {regroup_arg!r})")
+        return regrouped
     except Exception as exc:
-        print(f"stable-ts regroup failed ({exc}) — using original segments.")
+        print(f"Regroup failed ({exc}) — using original {before} segments.")
         return [
             {"start": s["start"], "end": s["end"], "text": s["text"]}
             for s in segments
