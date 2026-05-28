@@ -1,8 +1,9 @@
-version = '0.95'
+version = '0.96'
 
 import os
 import io
 import math
+import threading
 from fastapi import FastAPI, File, UploadFile, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from typing import Union
@@ -28,6 +29,27 @@ PCM_SAMPLE_RATE      = 16000
 PCM_NUM_CHANNELS     = 1
 PCM_BITS_PER_SAMPLE  = 16
 PCM_BYTES_PER_SAMPLE = PCM_BITS_PER_SAMPLE // 8
+
+# ---------------------------------------------------------------------------
+# Optional WhisperX alignment
+# If whisperx is installed, word-level forced alignment is applied after the
+# API transcription, giving more accurate subtitle boundaries.
+# Install: pip install whisperx (also requires torch)
+# Models are downloaded on first use per language and cached in
+# ~/.cache/torch — mount a volume there to persist across container restarts.
+# ---------------------------------------------------------------------------
+try:
+    import whisperx
+    import numpy as np
+    _whisperx_available = True
+except ImportError:
+    _whisperx_available = False
+
+# Per-language alignment model cache.
+# Models are loaded once and reused across requests.
+# Protected by _align_lock so concurrent requests don't trigger duplicate loads.
+_align_models: dict = {}
+_align_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +80,80 @@ def segments_to_srt(segments: list[dict]) -> str:
             f"{seg['text']}\n"
         )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# WhisperX alignment
+# ---------------------------------------------------------------------------
+
+def _get_align_model(language_code: str):
+    """
+    Load and cache the wav2vec2 alignment model for a given language.
+    The first load downloads the model (~200-400 MB depending on language).
+    Subsequent calls return the cached model instantly.
+    """
+    if language_code not in _align_models:
+        with _align_lock:
+            if language_code not in _align_models:
+                print(f"Loading WhisperX alignment model for '{language_code}' ...")
+                model_a, metadata = whisperx.load_align_model(
+                    language_code=language_code,
+                    device="cpu",
+                )
+                _align_models[language_code] = (model_a, metadata)
+                print(f"Alignment model for '{language_code}' loaded and cached.")
+    return _align_models[language_code]
+
+
+def align_segments(
+    segments: list[dict],
+    pcm_bytes: bytes,
+    language_code: str,
+) -> list[dict]:
+    """
+    Apply WhisperX forced alignment to refine segment timestamps.
+
+    Uses a language-specific wav2vec2 phoneme model to match each word in the
+    transcript to its exact position in the audio. This is fundamentally more
+    accurate than silence detection — it actually reads the speech, not just
+    the quiet gaps.
+
+    The aligned segment boundaries (start of first word, end of last word) are
+    used for SRT output. Falls back to the original segments on any error,
+    including unsupported languages.
+    """
+    if not _whisperx_available or not segments:
+        return segments
+
+    try:
+        model_a, metadata = _get_align_model(language_code)
+        audio = np.frombuffer(pcm_bytes, np.int16).astype(np.float32) / 32768.0
+        result = whisperx.align(
+            segments,
+            model_a,
+            metadata,
+            audio,
+            device="cpu",
+            return_char_alignments=False,
+        )
+
+        refined = []
+        for seg in result["segments"]:
+            words = seg.get("words", [])
+            # Use the aligned word boundaries for tighter start/end times.
+            # Fall back to the original segment times if words are missing.
+            start = words[0]["start"]  if words and "start" in words[0]  else seg["start"]
+            end   = words[-1]["end"]   if words and "end"   in words[-1] else seg["end"]
+            refined.append({
+                "start": start,
+                "end":   end,
+                "text":  seg["text"].strip(),
+            })
+        return refined
+
+    except Exception as exc:
+        print(f"WhisperX alignment failed ({exc}) — using unaligned segments.")
+        return segments
 
 
 # ---------------------------------------------------------------------------
@@ -104,10 +200,7 @@ def encode_pcm_to_opus(pcm_bytes: bytes) -> io.BytesIO:
 # ---------------------------------------------------------------------------
 
 def split_pcm_into_chunks(pcm_bytes: bytes, num_chunks: int) -> list[tuple[bytes, float]]:
-    """
-    Split raw PCM into num_chunks equal pieces with sample-accurate offsets.
-    Splitting happens on the PCM before encoding so timestamps are exact.
-    """
+    """Split raw PCM into num_chunks equal pieces with sample-accurate offsets."""
     total_samples     = len(pcm_bytes) // PCM_BYTES_PER_SAMPLE
     total_duration    = total_samples / PCM_SAMPLE_RATE
     samples_per_chunk = math.ceil(total_samples / num_chunks)
@@ -134,18 +227,26 @@ def split_pcm_into_chunks(pcm_bytes: bytes, num_chunks: int) -> list[tuple[bytes
 # Core transcription
 # ---------------------------------------------------------------------------
 
-def _call_api(opus: io.BytesIO, task: str, language: str | None) -> list[dict]:
-    """Call the provider with verbose_json and return segments as a list of dicts."""
+def _call_api(opus: io.BytesIO, task: str, language: str | None) -> tuple[list[dict], str]:
+    """
+    Call the provider with verbose_json.
+    Returns (segments, detected_language) — the detected language is used by
+    the WhisperX alignment model loader to pick the correct wav2vec2 model.
+    For translations the output is always English, so we return 'en'.
+    """
     opus.seek(0)
     if task == "transcribe":
         response = client.audio.transcriptions.create(
             model=whisper_model, file=opus, response_format="verbose_json", language=language,
         )
+        detected_language = getattr(response, "language", None) or language or "en"
     else:
         response = client.audio.translations.create(
             model=whisper_model, file=opus, response_format="verbose_json",
         )
-    return verbose_json_to_segments(response)
+        detected_language = "en"  # translations are always English
+
+    return verbose_json_to_segments(response), detected_language
 
 
 def _transcribe_pcm_chunks(
@@ -153,11 +254,19 @@ def _transcribe_pcm_chunks(
     task: str,
     language: str | None,
 ) -> str:
-    """Encode each PCM chunk to Opus, transcribe, apply sample-accurate offset, merge to SRT."""
+    """
+    Encode each PCM chunk to Opus, transcribe, align (if WhisperX available),
+    apply sample-accurate offset, and merge into one SRT.
+
+    Alignment runs against each chunk's own PCM audio while timestamps are
+    still chunk-relative (before the offset is added), so the wav2vec2 model
+    is always working against the correct audio window.
+    """
     all_segments: list[dict] = []
     for idx, (pcm_chunk, start_offset) in enumerate(pcm_chunks, start=1):
         print(f"Transcribing chunk {idx}/{len(pcm_chunks)} (offset={start_offset:.3f}s) ...")
-        segs = _call_api(encode_pcm_to_opus(pcm_chunk), task, language)
+        segs, detected_language = _call_api(encode_pcm_to_opus(pcm_chunk), task, language)
+        segs = align_segments(segs, pcm_chunk, detected_language)
         for seg in segs:
             seg["start"] += start_offset
             seg["end"]   += start_offset
@@ -170,11 +279,10 @@ def call_transcription(pcm_bytes: bytes, task: str, language: str | None) -> str
     Transcribe audio and return an SRT string.
 
       1. Encode to Opus  — check the actual output size.
-      2. Fits?           — single API call.
-      3. Too large?      — split PCM into N chunks, encode each, transcribe,
+      2. Fits?           — single API call, then align.
+      3. Too large?      — split PCM, encode each chunk, transcribe, align,
                            apply sample-accurate offset, merge.
-      4. 413 fallback    — force-split and retry if the provider rejects despite
-                           the size check passing.
+      4. 413 fallback    — force-split and retry.
     """
     opus      = encode_pcm_to_opus(pcm_bytes)
     opus_size = opus.getbuffer().nbytes
@@ -186,7 +294,9 @@ def call_transcription(pcm_bytes: bytes, task: str, language: str | None) -> str
 
     if opus_size <= MAX_UPLOAD_BYTES:
         try:
-            return segments_to_srt(_call_api(opus, task, language))
+            segs, detected_language = _call_api(opus, task, language)
+            segs = align_segments(segs, pcm_bytes, detected_language)
+            return segments_to_srt(segs)
         except Exception as exc:
             if not is_too_large_error(exc):
                 raise
@@ -258,10 +368,12 @@ def asr(
 
 
 if __name__ == "__main__":
+    whisperx_status = "whisperx active" if _whisperx_available else "whisperx not installed"
     print(
         f"Running Bazarr to OpenAI Whisper Bridge ({docker_status}) v{version} | "
         f"model: {whisper_model} | "
         f"opus: {OPUS_BITRATE_BPS // 1000} kbps | "
-        f"max upload: {MAX_UPLOAD_BYTES // 1024 // 1024} MB (MAX_UPLOAD_MB)"
+        f"max upload: {MAX_UPLOAD_BYTES // 1024 // 1024} MB | "
+        f"{whisperx_status}"
     )
     uvicorn.run(app, host="0.0.0.0", port=9000)
