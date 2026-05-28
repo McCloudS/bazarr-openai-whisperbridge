@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 RUN pip install --no-cache-dir \
-    torch --index-url https://download.pytorch.org/whl/cpu
+    torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 
 RUN pip install --no-cache-dir \
     fastapi uvicorn python-multipart ffmpeg-python openai stable-ts-whisperless
