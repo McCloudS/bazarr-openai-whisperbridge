@@ -12,7 +12,7 @@ RUN apk add --no-cache \
 # Set the working directory in the container
 WORKDIR /app
 
-RUN pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu --no-cache-dir
+RUN pip install torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cpu --no-cache-dir
 
 # Install Python dependencies directly with pip
 RUN pip install --no-cache-dir \
