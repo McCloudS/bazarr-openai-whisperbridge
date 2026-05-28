@@ -13,12 +13,7 @@ RUN pip install --no-cache-dir \
     torch --index-url https://download.pytorch.org/whl/cpu
 
 RUN pip install --no-cache-dir \
-    fastapi \
-    uvicorn \
-    python-multipart \
-    ffmpeg-python \
-    openai \
-    whisperx
+    fastapi uvicorn python-multipart ffmpeg-python openai stable-ts-whisperless
 
 COPY bazarr-openai-whisperbridge.py /app/
 CMD ["python", "bazarr-openai-whisperbridge.py"]
