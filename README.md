@@ -19,6 +19,4 @@ Download the .py script, set the environment variables above, and have ffmpeg in
 | MAX_UPLOAD_MB | '24' | Size of audio file before it chunks it for upload/processing.  Gets around file size restrictions on OpenAI and Groq endpoints. |
 
 # Caveats/Notes
-* If stable-ts-whisperless is installed (with torch and torch audio), it will attempt to suppress the silence better.
-
 * OpenAI's endpoint does not have a detect language equivalent, so we have to force it to what we want or it will default to return English.
