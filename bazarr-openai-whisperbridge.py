@@ -1,4 +1,4 @@
-version = '0.7'
+version = '0.8'
 
 import os
 import io
@@ -21,21 +21,28 @@ client = OpenAI()
 force_detected_language_to = os.getenv('FORCE_DETECTED_LANGUAGE_TO', 'en')
 whisper_model = os.getenv('WHISPER_MODEL', 'whisper-1')
 
-MAX_UPLOAD_BYTES = int(os.getenv('MAX_UPLOAD_MB', '24')) * 1024 * 1024
+MAX_UPLOAD_BYTES  = int(os.getenv('MAX_UPLOAD_MB', '24')) * 1024 * 1024
+OPUS_BITRATE_BPS  = int(os.getenv('OPUS_BITRATE_KBPS', '24')) * 1000
+OPUS_APPLICATION  = "audio"
 
 PCM_SAMPLE_RATE      = 16000
 PCM_NUM_CHANNELS     = 1
 PCM_BITS_PER_SAMPLE  = 16
 PCM_BYTES_PER_SAMPLE = PCM_BITS_PER_SAMPLE // 8
 
-# 24 kbps is the sweet spot for Whisper: a 2-hour film encodes to ~20 MB
-# (comfortably under the 25 MB provider limit), and quality is perceptually
-# transparent for speech at this rate.
-# application="audio" preserves the full audio signal without the noise
-# suppression and VAD that application="voip" applies — important for quiet
-# dialogue, accents, and anything Whisper needs to hear unmodified.
-OPUS_BITRATE_BPS  = int(os.getenv('OPUS_BITRATE_KBPS', '24')) * 1000
-OPUS_APPLICATION  = "audio"
+# ---------------------------------------------------------------------------
+# Optional stable-ts import
+# If stable-ts and numpy are installed, segment boundaries are snapped to the
+# nearest silence point in the audio after transcription, improving subtitle
+# timing without any change to the API provider or model.
+# Install: pip install stable-ts numpy
+# ---------------------------------------------------------------------------
+try:
+    import stable_whisper
+    import numpy as np
+    _stable_ts_available = True
+except ImportError:
+    _stable_ts_available = False
 
 _provider_supports_srt: bool | None = None
 _provider_lock = threading.Lock()
@@ -76,6 +83,43 @@ def verbose_json_to_srt(response) -> str:
 
 
 # ---------------------------------------------------------------------------
+# stable-ts refinement
+# ---------------------------------------------------------------------------
+
+def refine_segments(segments: list[dict], pcm_bytes: bytes) -> list[dict]:
+    """
+    Snap segment start/end boundaries to the nearest silence point in the
+    audio using stable-ts. This improves subtitle timing without re-running
+    the Whisper model — it only analyses the audio waveform locally.
+
+    Refinement is applied to the chunk's own PCM audio with timestamps still
+    relative to the chunk start (offset is added afterward), so the silence
+    detection is always working against the correct audio window.
+
+    Falls back to the original segments silently on any error.
+    """
+    if not _stable_ts_available or not segments:
+        return segments
+
+    try:
+        result = stable_whisper.WhisperResult({
+            "segments": [
+                {"start": s["start"], "end": s["end"], "text": s["text"], "words": []}
+                for s in segments
+            ]
+        })
+        audio = np.frombuffer(pcm_bytes, np.int16).astype(np.float32) / 32768.0
+        result.suppress_silence(audio, sr=PCM_SAMPLE_RATE)
+        return [
+            {"start": seg.start, "end": seg.end, "text": seg.text}
+            for seg in result.segments
+        ]
+    except Exception as exc:
+        print(f"stable-ts refinement failed ({exc}) — using unrefined segments.")
+        return segments
+
+
+# ---------------------------------------------------------------------------
 # Error classification
 # ---------------------------------------------------------------------------
 
@@ -95,15 +139,6 @@ def is_too_large_error(exc: Exception) -> bool:
 # ---------------------------------------------------------------------------
 
 def encode_pcm_to_opus(pcm_bytes: bytes) -> io.BytesIO:
-    """
-    Encode raw PCM bytes to Opus/OGG and return a named BytesIO.
-
-    Settings chosen for Whisper transcription quality:
-      - 24 kbps: perceptually transparent for speech; 2-hour film ≈ 20 MB
-      - application=audio: preserves the full signal without the noise
-        suppression / VAD that voip mode applies
-      - 16 kHz mono: matches Whisper's internal sample rate exactly
-    """
     try:
         out, _ = (
             ffmpeg.input("pipe:0", format="s16le", ar=PCM_SAMPLE_RATE, ac=PCM_NUM_CHANNELS)
@@ -133,10 +168,8 @@ def encode_pcm_to_opus(pcm_bytes: bytes) -> io.BytesIO:
 
 def split_pcm_into_chunks(pcm_bytes: bytes, num_chunks: int) -> list[tuple[bytes, float]]:
     """
-    Split raw PCM bytes into exactly num_chunks equal pieces.
-
-    Offsets are computed from sample index / sample rate — exact to the
-    sample, with no encoding delay or seek imprecision across chunks.
+    Split raw PCM into num_chunks equal pieces with sample-accurate offsets.
+    Splitting happens on the PCM before encoding so timestamps are exact.
     """
     total_samples     = len(pcm_bytes) // PCM_BYTES_PER_SAMPLE
     total_duration    = total_samples / PCM_SAMPLE_RATE
@@ -176,26 +209,23 @@ def _call_api(opus: io.BytesIO, task: str, language: str | None, fmt: str):
         )
 
 
-def _transcribe_single(opus: io.BytesIO, task: str, language: str | None) -> str:
-    """Transcribe a single Opus file, probing and caching the provider's format support."""
+def _probe_provider(opus: io.BytesIO, task: str, language: str | None) -> None:
+    """
+    Probe the provider once to determine srt vs verbose_json support and cache
+    the result. Safe to call from multiple threads — only one probe fires.
+    """
     global _provider_supports_srt
 
-    if _provider_supports_srt is True:
-        return _call_api(opus, task, language, "srt")
-    if _provider_supports_srt is False:
-        return verbose_json_to_srt(_call_api(opus, task, language, "verbose_json"))
+    if _provider_supports_srt is not None:
+        return
 
     with _provider_lock:
-        if _provider_supports_srt is True:
-            return _call_api(opus, task, language, "srt")
-        if _provider_supports_srt is False:
-            return verbose_json_to_srt(_call_api(opus, task, language, "verbose_json"))
-
+        if _provider_supports_srt is not None:
+            return
         try:
-            response = _call_api(opus, task, language, "srt")
+            _call_api(opus, task, language, "srt")
             _provider_supports_srt = True
             print("Provider supports response_format=srt — caching for future requests.")
-            return response
         except BadRequestError as exc:
             if not is_format_rejection(exc):
                 raise
@@ -204,30 +234,28 @@ def _transcribe_single(opus: io.BytesIO, task: str, language: str | None) -> str
                 "Using verbose_json — caching for future requests."
             )
             _provider_supports_srt = False
-            return verbose_json_to_srt(_call_api(opus, task, language, "verbose_json"))
 
 
-def _transcribe_chunk_verbose(opus: io.BytesIO, task: str, language: str | None) -> list[dict]:
-    """Transcribe one chunk with verbose_json. Sets _provider_supports_srt as a side-effect."""
-    global _provider_supports_srt
-
-    if _provider_supports_srt is None:
-        with _provider_lock:
-            if _provider_supports_srt is None:
-                try:
-                    _call_api(opus, task, language, "srt")
-                    _provider_supports_srt = True
-                    print("Provider supports response_format=srt — caching for future requests.")
-                except BadRequestError as exc:
-                    if not is_format_rejection(exc):
-                        raise
-                    print(
-                        f"Provider rejected response_format=srt ({exc}). "
-                        "Using verbose_json — caching for future requests."
-                    )
-                    _provider_supports_srt = False
-
+def _transcribe_to_segments(opus: io.BytesIO, task: str, language: str | None) -> list[dict]:
+    """
+    Transcribe one Opus file and return segments as a list of dicts.
+    Always uses verbose_json so callers can post-process timestamps.
+    Sets _provider_supports_srt as a side-effect on the first call.
+    """
+    _probe_provider(opus, task, language)
     return verbose_json_to_segments(_call_api(opus, task, language, "verbose_json"))
+
+
+def _transcribe_single(opus: io.BytesIO, task: str, language: str | None) -> str:
+    """
+    Transcribe a single Opus file and return an SRT string.
+    Uses the provider's native srt format when supported (no stable-ts path).
+    """
+    _probe_provider(opus, task, language)
+
+    if _provider_supports_srt:
+        return _call_api(opus, task, language, "srt")
+    return verbose_json_to_srt(_call_api(opus, task, language, "verbose_json"))
 
 
 def _transcribe_pcm_chunks(
@@ -235,16 +263,30 @@ def _transcribe_pcm_chunks(
     task: str,
     language: str | None,
 ) -> str:
-    """Encode each PCM chunk to Opus, transcribe, apply offset, and merge into one SRT."""
+    """
+    Encode each PCM chunk to Opus, transcribe, optionally refine with stable-ts,
+    apply the sample-accurate time offset, then merge all segments into one SRT.
+
+    stable-ts refinement runs against each chunk's own PCM audio while the
+    timestamps are still chunk-relative (before the offset is added), so
+    silence detection is always looking at the correct audio window.
+    """
     all_segments: list[dict] = []
+
     for idx, (pcm_chunk, start_offset) in enumerate(pcm_chunks, start=1):
         print(f"Transcribing chunk {idx}/{len(pcm_chunks)} (offset={start_offset:.3f}s) ...")
         opus = encode_pcm_to_opus(pcm_chunk)
-        segs = _transcribe_chunk_verbose(opus, task, language)
+        segs = _transcribe_to_segments(opus, task, language)
+
+        # Refine before offsetting — stable-ts analyses the chunk's audio and
+        # timestamps are still relative to the chunk start at this point.
+        segs = refine_segments(segs, pcm_chunk)
+
         for seg in segs:
             seg["start"] += start_offset
             seg["end"]   += start_offset
         all_segments.extend(segs)
+
     return segments_to_srt(all_segments)
 
 
@@ -252,19 +294,16 @@ def call_transcription(pcm_bytes: bytes, task: str, language: str | None) -> str
     """
     Transcribe audio and return an SRT string.
 
-    Always encodes the full PCM to Opus first so we can check the real file
-    size before deciding whether to chunk. This avoids estimating from PCM
-    duration and then hitting a 413 on the first API call.
-
-      1. Encode to Opus  — fast, local. Check the actual output size.
-      2. Fits?           — send as a single file.
-      3. Too large?      — split the original PCM into N chunks (sample-accurate
-                           offsets), encode each chunk, transcribe and merge.
-      4. 413 fallback    — if the provider still rejects despite the size check
-                           passing (lower actual limit than MAX_UPLOAD_MB), split
-                           and retry.
+      1. Encode to Opus  — check the actual output size.
+      2. Fits?           — transcribe as a single file.
+                           If stable-ts is installed, use verbose_json + refine.
+                           Otherwise use the provider's native srt if supported.
+      3. Too large?      — split PCM into N chunks, encode each, transcribe,
+                           refine (if stable-ts), offset, merge.
+      4. 413 fallback    — force-split and retry if the provider rejects despite
+                           the size check passing.
     """
-    # ── 1. Encode to Opus and check actual size ──────────────────────────────
+    # ── 1. Encode and check actual size ─────────────────────────────────────
     opus      = encode_pcm_to_opus(pcm_bytes)
     opus_size = opus.getbuffer().nbytes
     print(
@@ -276,23 +315,28 @@ def call_transcription(pcm_bytes: bytes, task: str, language: str | None) -> str
     # ── 2. Single-file path ──────────────────────────────────────────────────
     if opus_size <= MAX_UPLOAD_BYTES:
         try:
-            return _transcribe_single(opus, task, language)
+            if _stable_ts_available:
+                # Use verbose_json so we can refine before rendering SRT
+                segs = _transcribe_to_segments(opus, task, language)
+                segs = refine_segments(segs, pcm_bytes)
+                return segments_to_srt(segs)
+            else:
+                return _transcribe_single(opus, task, language)
+
         except Exception as exc:
             if not is_too_large_error(exc):
                 raise
-            # Provider's actual limit is lower than MAX_UPLOAD_BYTES.
             print(
                 f"Provider returned 413 despite {opus_size / 1024 / 1024:.1f} MB Opus file. "
                 f"Consider lowering MAX_UPLOAD_MB (currently {MAX_UPLOAD_BYTES // 1024 // 1024}). "
                 f"Splitting into chunks and retrying."
             )
-            # num_chunks based on actual size so each chunk is safely under the limit
             num_chunks = max(2, math.ceil(opus_size / MAX_UPLOAD_BYTES) + 1)
             return _transcribe_pcm_chunks(
                 split_pcm_into_chunks(pcm_bytes, num_chunks), task, language
             )
 
-    # ── 3. Pre-split path (actual Opus too large) ────────────────────────────
+    # ── 3. Pre-split path ────────────────────────────────────────────────────
     num_chunks = max(2, math.ceil(opus_size / MAX_UPLOAD_BYTES))
     print(f"Opus file ({opus_size / 1024 / 1024:.1f} MB) exceeds limit — splitting into {num_chunks} chunks.")
     return _transcribe_pcm_chunks(
@@ -351,10 +395,12 @@ def asr(
 
 
 if __name__ == "__main__":
+    stable_ts_status = f"stable-ts active" if _stable_ts_available else "stable-ts not installed"
     print(
-        f"Running Bazarr to OpenAI Whisper Bridge ({docker_status}) v{version} "
-        f"using model: {whisper_model}, "
-        f"opus: {OPUS_BITRATE_BPS // 1000} kbps / {OPUS_APPLICATION} (OPUS_BITRATE_KBPS), "
-        f"max upload: {MAX_UPLOAD_BYTES // 1024 // 1024} MB (MAX_UPLOAD_MB)"
+        f"Running Bazarr to OpenAI Whisper Bridge ({docker_status}) v{version} | "
+        f"model: {whisper_model} | "
+        f"opus: {OPUS_BITRATE_BPS // 1000} kbps | "
+        f"max upload: {MAX_UPLOAD_BYTES // 1024 // 1024} MB | "
+        f"{stable_ts_status}"
     )
     uvicorn.run(app, host="0.0.0.0", port=9000)
