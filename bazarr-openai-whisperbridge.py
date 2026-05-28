@@ -1,4 +1,4 @@
-version = '0.4'
+version = '0.9'
 
 import os
 import io
@@ -86,56 +86,24 @@ def verbose_json_to_srt(response) -> str:
 # stable-ts refinement
 # ---------------------------------------------------------------------------
 
-def _detect_silence(
-    audio: "np.ndarray",
-    sample_rate: int = PCM_SAMPLE_RATE,
-    min_silence_ms: int = 300,
-    threshold: float = 0.02,
-) -> tuple:
-    """
-    Detect silence regions in a float32 audio array normalised to [-1, 1].
-    Returns (silent_starts, silent_ends) as float32 numpy arrays of seconds.
-
-    Uses 20ms RMS energy frames. Regions where RMS stays below `threshold`
-    for at least `min_silence_ms` are reported as silence.
-    """
-    frame_samples = int(sample_rate * 0.02)          # 20ms frames
-    min_frames    = max(1, min_silence_ms // 20)
-
-    n_frames = len(audio) // frame_samples
-    if n_frames == 0:
-        return np.array([]), np.array([])
-
-    frames = audio[: n_frames * frame_samples].reshape(n_frames, frame_samples)
-    rms    = np.sqrt(np.mean(frames ** 2, axis=1))
-    silent = rms < threshold
-
-    starts, ends = [], []
-    i = 0
-    while i < len(silent):
-        if silent[i]:
-            j = i + 1
-            while j < len(silent) and silent[j]:
-                j += 1
-            if j - i >= min_frames:
-                starts.append(i * 0.02)   # frame index → seconds
-                ends.append(j   * 0.02)
-            i = j
-        else:
-            i += 1
-
-    return np.array(starts, dtype=np.float32), np.array(ends, dtype=np.float32)
-
-
 def refine_segments(segments: list[dict], pcm_bytes: bytes) -> list[dict]:
     """
-    Snap segment start/end boundaries to the nearest silence point in the
-    audio using stable-ts. This improves subtitle timing without re-running
-    the Whisper model — it only analyses the audio waveform locally.
+    Refine segment timestamps using stable-ts's transcribe_any() — the
+    documented API for using stable-ts with any external ASR model or API.
 
-    Refinement is applied to the chunk's own PCM audio with timestamps still
-    relative to the chunk start (offset is added afterward), so the silence
-    detection is always working against the correct audio window.
+    Rather than constructing silence arrays manually and calling suppress_silence,
+    we pass stable-ts a mock inference function that returns our already-computed
+    segments. stable-ts then:
+      1. Analyses the raw audio itself to detect non-speech regions
+      2. Calls our mock function (which returns the pre-computed segments)
+      3. Applies its own silence suppression to adjust segment boundaries
+
+    This is the intended usage pattern for external ASR — stable-ts does all
+    the audio analysis, we just supply the transcription text and timestamps.
+
+    Refinement is applied while timestamps are still relative to the chunk start
+    (before the offset is added), so stable-ts is always analysing the correct
+    audio window.
 
     Falls back to the original segments silently on any error.
     """
@@ -144,17 +112,24 @@ def refine_segments(segments: list[dict], pcm_bytes: bytes) -> list[dict]:
 
     try:
         audio = np.frombuffer(pcm_bytes, np.int16).astype(np.float32) / 32768.0
-        silent_starts, silent_ends = _detect_silence(audio)
 
-        result = stable_whisper.WhisperResult({
+        precomputed = {
+            "text": " ".join(s["text"] for s in segments),
             "segments": [
                 {"start": s["start"], "end": s["end"], "text": s["text"], "words": []}
                 for s in segments
-            ]
-        })
+            ],
+        }
 
-        if len(silent_starts) > 0:
-            result.suppress_silence(silent_starts, silent_ends)
+        # stable-ts calls this with WAV bytes (audio_type="bytes"); we ignore
+        # the audio input and return our pre-computed API result.
+        result = stable_whisper.transcribe_any(
+            lambda audio_input, **_: precomputed,
+            audio,
+            input_sr=PCM_SAMPLE_RATE,
+            audio_type="bytes",
+            suppress_silence=True,
+        )
 
         return [
             {"start": seg.start, "end": seg.end, "text": seg.text}
