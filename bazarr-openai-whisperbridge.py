@@ -119,7 +119,7 @@ def refine_segments(segments: list[dict], pcm_bytes: bytes) -> list[dict]:
         # stable-ts passes the numpy array directly (audio_type="numpy"); we ignore
         # the audio input and return our pre-computed API result.
         result = stable_whisper.transcribe_any(
-            lambda audio_input, **_: precomputed,
+            lambda *args, **kwargs: precomputed,
             audio,
             input_sr=PCM_SAMPLE_RATE,
             audio_type="numpy",
