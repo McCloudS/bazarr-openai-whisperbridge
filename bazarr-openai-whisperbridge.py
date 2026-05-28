@@ -1,4 +1,4 @@
-version = '0.92'
+version = '0.93'
 
 import os
 import io
@@ -116,13 +116,13 @@ def refine_segments(segments: list[dict], pcm_bytes: bytes) -> list[dict]:
             ],
         }
 
-        # stable-ts calls this with WAV bytes (audio_type="byte"); we ignore
+        # stable-ts passes the numpy array directly (audio_type="numpy"); we ignore
         # the audio input and return our pre-computed API result.
         result = stable_whisper.transcribe_any(
             lambda audio_input, **_: precomputed,
             audio,
             input_sr=PCM_SAMPLE_RATE,
-            audio_type="byte",
+            audio_type="numpy",
             suppress_silence=True,
         )
 
