@@ -254,7 +254,7 @@ def _call_api(opus: io.BytesIO, task: str, language: str | None) -> list[dict]:
             file=opus,
             response_format="verbose_json",
             language=language,
-            timestamp_granularities=["word"],
+            timestamp_granularities=["word", "segment"],
         )
     else:
         response = client.audio.translations.create(
@@ -356,12 +356,11 @@ def asr(
             if video_file else f"Transcription complete in {mins}m {secs}s."
         )
 
-        if srt_content:
-            return StreamingResponse(
-                iter([srt_content]),
-                media_type="text/plain",
-                headers={"Source": "Transcribed using Bazarr to OpenAI Whisper Bridge!"},
-            )
+        return StreamingResponse(
+            iter([srt_content or ""]),
+            media_type="text/plain",
+            headers={"Source": "Transcribed using Bazarr to OpenAI Whisper Bridge!"},
+        )
 
     except Exception as e:
         traceback.print_exc()
