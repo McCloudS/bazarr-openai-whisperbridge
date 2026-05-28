@@ -87,6 +87,12 @@ def verbose_json_to_segments(response) -> list[dict]:
     ]
     if top_words:
         top_words.sort(key=lambda w: w["start"])
+        # stable-ts reconstructs segment text by concatenating word tokens.
+        # Whisper tokens normally include a leading space (" Hello"), but Groq
+        # returns bare words ("Hello"). Add the space so joined text reads correctly.
+        for i, w in enumerate(top_words):
+            if i > 0 and not w["word"].startswith(" "):
+                w["word"] = " " + w["word"]
         full_text = (getattr(response, "text", "") or "").strip()
         print(f"Using {len(top_words)} top-level words for regroup.")
         return [{
