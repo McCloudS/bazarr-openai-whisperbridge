@@ -1,4 +1,4 @@
-version = '0.97-debug'
+version = '0.98'
 
 import os
 import io
@@ -64,11 +64,38 @@ def seconds_to_srt_timestamp(seconds: float) -> str:
 
 def verbose_json_to_segments(response) -> list[dict]:
     """
-    Extract segments from a verbose_json response, including word-level
-    timestamps when the provider returns them (Groq/OpenAI with
-    timestamp_granularities=["word"]).  Word data is used by stable-ts
-    regroup for natural subtitle boundaries.
+    Extract segments from a verbose_json response, including word-level timestamps.
+
+    Prefers top-level words (Groq format) over segment-nested words (OpenAI format).
+    When top-level words are present, we build a single synthetic segment covering
+    the full audio and attach all words to it — stable-ts regroup then handles all
+    the actual segmentation, so we're not constrained by the provider's boundaries.
+
+    Falls back to segment-level words or plain segments if neither is available.
     """
+    # --- prefer top-level words (Groq) ---
+    top_words = [
+        {
+            "word":  getattr(w, "word",  ""),
+            "start": getattr(w, "start", None),
+            "end":   getattr(w, "end",   None),
+            "score": getattr(w, "probability", 1.0),
+        }
+        for w in (getattr(response, "words", None) or [])
+        if getattr(w, "start", None) is not None
+        and getattr(w, "end",   None) is not None
+    ]
+    if top_words:
+        full_text = (getattr(response, "text", "") or "").strip()
+        print(f"Using {len(top_words)} top-level words for regroup.")
+        return [{
+            "start": top_words[0]["start"],
+            "end":   top_words[-1]["end"],
+            "text":  full_text,
+            "words": top_words,
+        }]
+
+    # --- fall back to segment-nested words (OpenAI) or plain segments ---
     raw_segments = getattr(response, "segments", None) or []
     segments = []
     for seg in raw_segments:
