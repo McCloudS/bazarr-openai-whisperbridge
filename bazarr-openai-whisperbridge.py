@@ -68,20 +68,27 @@ def verbose_json_to_segments(response) -> list[dict]:
     timestamp_granularities=["word"]).  Word data is used by stable-ts
     regroup for natural subtitle boundaries.
     """
+    raw_segments = getattr(response, "segments", None) or []
     segments = []
-    for seg in response.segments:
-        s = {"start": seg.start, "end": seg.end, "text": seg.text.strip()}
+    for seg in raw_segments:
+        start = getattr(seg, "start", None)
+        end   = getattr(seg, "end",   None)
+        text  = (getattr(seg, "text", "") or "").strip()
+        if start is None or end is None:
+            continue
+        s = {"start": start, "end": end, "text": text}
         words = getattr(seg, "words", None)
         if words:
             s["words"] = [
                 {
-                    "word":  w.word,
+                    "word":  getattr(w, "word", ""),
                     "start": w.start,
                     "end":   w.end,
                     "score": getattr(w, "probability", 1.0),
                 }
                 for w in words
-                if w.start is not None and w.end is not None
+                if getattr(w, "start", None) is not None
+                and getattr(w, "end",   None) is not None
             ]
         segments.append(s)
     return segments
@@ -139,7 +146,8 @@ def regroup_segments(segments: list[dict]) -> list[dict]:
                             "end":         w.get("end"),
                             "probability": w.get("score", 1.0),
                         }
-                        for w in seg.get("words", [])
+                        for w in (seg.get("words") or [])
+                        if w.get("start") is not None and w.get("end") is not None
                     ],
                 }
                 for seg in segments
