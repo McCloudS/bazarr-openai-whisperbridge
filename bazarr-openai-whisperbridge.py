@@ -1,13 +1,12 @@
-version = '0.9'
+version = '0.91'
 
 import os
 import io
 import math
-import threading
 from fastapi import FastAPI, File, UploadFile, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from typing import Union
-from openai import OpenAI, BadRequestError, APIStatusError
+from openai import OpenAI, APIStatusError
 import ffmpeg
 import time
 import uvicorn
@@ -43,10 +42,6 @@ try:
     _stable_ts_available = True
 except ImportError:
     _stable_ts_available = False
-
-_provider_supports_srt: bool | None = None
-_provider_lock = threading.Lock()
-
 
 # ---------------------------------------------------------------------------
 # SRT helpers
@@ -144,10 +139,6 @@ def refine_segments(segments: list[dict], pcm_bytes: bytes) -> list[dict]:
 # Error classification
 # ---------------------------------------------------------------------------
 
-def is_format_rejection(exc: BadRequestError) -> bool:
-    return "response_format" in str(exc).lower()
-
-
 def is_too_large_error(exc: Exception) -> bool:
     if isinstance(exc, APIStatusError) and exc.status_code == 413:
         return True
@@ -218,78 +209,29 @@ def split_pcm_into_chunks(pcm_bytes: bytes, num_chunks: int) -> list[tuple[bytes
 # Core transcription
 # ---------------------------------------------------------------------------
 
-def _call_api(opus: io.BytesIO, task: str, language: str | None, fmt: str):
+def _call_api(opus: io.BytesIO, task: str, language: str | None) -> list[dict]:
+    """
+    Call the provider with response_format=verbose_json and return segments.
+
+    We always use verbose_json rather than srt because:
+      - stable-ts needs structured segment data (start/end/text) to apply
+        silence suppression — it cannot work from a raw SRT string.
+      - Our own verbose_json → SRT conversion is faithful, so there is no
+        quality difference vs the provider's native SRT output.
+      - This removes the need for the srt-support probe, the provider cache,
+        and the threading lock — the code is simpler and works with any
+        OpenAI-compatible provider without a first-request round trip.
+    """
     opus.seek(0)
     if task == "transcribe":
-        return client.audio.transcriptions.create(
-            model=whisper_model, file=opus, response_format=fmt, language=language,
+        response = client.audio.transcriptions.create(
+            model=whisper_model, file=opus, response_format="verbose_json", language=language,
         )
     else:
-        return client.audio.translations.create(
-            model=whisper_model, file=opus, response_format=fmt,
+        response = client.audio.translations.create(
+            model=whisper_model, file=opus, response_format="verbose_json",
         )
-
-
-def _transcribe_to_segments(opus: io.BytesIO, task: str, language: str | None) -> list[dict]:
-    """
-    Transcribe one Opus file and return segments as a list of dicts.
-    Always uses verbose_json so callers can post-process timestamps.
-
-    On the very first call, probes the provider under lock to determine srt vs
-    verbose_json support. The probe result is cached so all subsequent calls
-    skip the lock entirely. Only one probe ever fires across all threads.
-    """
-    global _provider_supports_srt
-
-    if _provider_supports_srt is None:
-        with _provider_lock:
-            if _provider_supports_srt is None:
-                try:
-                    _call_api(opus, task, language, "srt")
-                    _provider_supports_srt = True
-                    print("Provider supports response_format=srt — caching for future requests.")
-                except BadRequestError as exc:
-                    if not is_format_rejection(exc):
-                        raise
-                    print(
-                        f"Provider rejected response_format=srt ({exc}). "
-                        "Using verbose_json — caching for future requests."
-                    )
-                    _provider_supports_srt = False
-
-    return verbose_json_to_segments(_call_api(opus, task, language, "verbose_json"))
-
-
-def _transcribe_single(opus: io.BytesIO, task: str, language: str | None) -> str:
-    """
-    Transcribe a single Opus file and return an SRT string.
-    Uses the provider's native srt format when supported (no stable-ts path).
-
-    On the very first call, probes under lock and returns the probe response
-    directly — no wasted round trip.
-    """
-    global _provider_supports_srt
-
-    if _provider_supports_srt is None:
-        with _provider_lock:
-            if _provider_supports_srt is None:
-                try:
-                    response = _call_api(opus, task, language, "srt")
-                    _provider_supports_srt = True
-                    print("Provider supports response_format=srt — caching for future requests.")
-                    return response  # reuse the probe response directly
-                except BadRequestError as exc:
-                    if not is_format_rejection(exc):
-                        raise
-                    print(
-                        f"Provider rejected response_format=srt ({exc}). "
-                        "Using verbose_json — caching for future requests."
-                    )
-                    _provider_supports_srt = False
-
-    if _provider_supports_srt:
-        return _call_api(opus, task, language, "srt")
-    return verbose_json_to_srt(_call_api(opus, task, language, "verbose_json"))
+    return verbose_json_to_segments(response)
 
 
 def _transcribe_pcm_chunks(
@@ -310,7 +252,7 @@ def _transcribe_pcm_chunks(
     for idx, (pcm_chunk, start_offset) in enumerate(pcm_chunks, start=1):
         print(f"Transcribing chunk {idx}/{len(pcm_chunks)} (offset={start_offset:.3f}s) ...")
         opus = encode_pcm_to_opus(pcm_chunk)
-        segs = _transcribe_to_segments(opus, task, language)
+        segs = _call_api(opus, task, language)
 
         # Refine before offsetting — stable-ts analyses the chunk's audio and
         # timestamps are still relative to the chunk start at this point.
@@ -329,11 +271,9 @@ def call_transcription(pcm_bytes: bytes, task: str, language: str | None) -> str
     Transcribe audio and return an SRT string.
 
       1. Encode to Opus  — check the actual output size.
-      2. Fits?           — transcribe as a single file.
-                           If stable-ts is installed, use verbose_json + refine.
-                           Otherwise use the provider's native srt if supported.
+      2. Fits?           — transcribe as a single file, refine with stable-ts.
       3. Too large?      — split PCM into N chunks, encode each, transcribe,
-                           refine (if stable-ts), offset, merge.
+                           refine, offset, merge.
       4. 413 fallback    — force-split and retry if the provider rejects despite
                            the size check passing.
     """
@@ -349,13 +289,9 @@ def call_transcription(pcm_bytes: bytes, task: str, language: str | None) -> str
     # ── 2. Single-file path ──────────────────────────────────────────────────
     if opus_size <= MAX_UPLOAD_BYTES:
         try:
-            if _stable_ts_available:
-                # Use verbose_json so we can refine before rendering SRT
-                segs = _transcribe_to_segments(opus, task, language)
-                segs = refine_segments(segs, pcm_bytes)
-                return segments_to_srt(segs)
-            else:
-                return _transcribe_single(opus, task, language)
+            segs = _call_api(opus, task, language)
+            segs = refine_segments(segs, pcm_bytes)
+            return segments_to_srt(segs)
 
         except Exception as exc:
             if not is_too_large_error(exc):
