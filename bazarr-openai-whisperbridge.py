@@ -1,8 +1,9 @@
-version = '0.97-stable-ts'
+version = '0.97-debug'
 
 import os
 import io
 import math
+import traceback
 from fastapi import FastAPI, File, UploadFile, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from typing import Union
@@ -183,7 +184,7 @@ def is_too_large_error(exc: Exception) -> bool:
 
 def encode_pcm_to_opus(pcm_bytes: bytes) -> io.BytesIO:
     try:
-        out, _ = (
+        out, err = (
             ffmpeg.input("pipe:0", format="s16le", ar=PCM_SAMPLE_RATE, ac=PCM_NUM_CHANNELS)
             .output(
                 "pipe:1",
@@ -197,12 +198,16 @@ def encode_pcm_to_opus(pcm_bytes: bytes) -> io.BytesIO:
             .overwrite_output()
             .run(capture_stdout=True, capture_stderr=True, input=pcm_bytes)
         )
+        if not out:
+            stderr_msg = err.decode(errors="replace") if err else "(no stderr)"
+            raise RuntimeError(f"FFmpeg produced no output. stderr: {stderr_msg}")
         opus = io.BytesIO(out)
         opus.name = "audio.ogg"
         opus.seek(0)
         return opus
     except ffmpeg.Error as e:
-        raise RuntimeError(f"FFmpeg error: {e.stderr.decode()}") from e
+        stderr_msg = e.stderr.decode(errors="replace") if e.stderr else "(no stderr)"
+        raise RuntimeError(f"FFmpeg error: {stderr_msg}") from e
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +364,7 @@ def asr(
             )
 
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
