@@ -18,7 +18,9 @@ RUN pip install --no-cache-dir \
     uvicorn \
     python-multipart \
     ffmpeg-python \
-    openai
+    openai \
+    numpy \
+    stable-ts-whisperless
 
 # Copy the application script into the container
 COPY bazarr-openai-whisperbridge.py /app/
