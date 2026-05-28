@@ -1,23 +1,88 @@
 # bazarr-openai-whisperbridge
-A bridge to use Bazarr's Whisper provider with OpenAI formatted providers.
 
-### How to use:
-Configure in Bazarr the same as a regular Whisper provider.
-## Docker: 
-Download from Dockerhub @ `mccloud/bazarr-openai-whisperbridge` and set the following environment variables: `OPENAI_API_KEY` (Mandatory for all providers) & `OPENAI_BASE_URL` (optional if using OpenAI endpoint), and map your port (default 9000).
-## Standalone:
-Download the .py script, set the environment variables above, and have ffmpeg installed & `pip install fastapi uvicorn python-multipart ffmpeg-python openai`, run script.
+A bridge that lets Bazarr's Whisper provider work with any OpenAI-compatible transcription endpoint — including OpenAI, Groq, and others.
 
-### Variables:
+> **Prefer fully self-hosted?** Check out [Subgen](https://github.com/McCloudS/subgen), which runs Whisper locally on your own hardware with integrations to Jellyfin, Plex, Emby, Tautulli, or Bazarr.
 
-| Variable              | Default Value | Description                                                                                                                                                                              |
-|-----------------------|---------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| OPENAI_API_KEY         | ''        | Required for all providers |
-| OPENAI_BASE_URL | '' | Optional if you want a custom provider, otherwise the OpenAI client defaults it to OpenAI's endpoint |
-| FORCE_DETECTED_LANGUAGE_TO | 'en' | If detect_language is called from Bazarr's Whisper provider, it will return this language, must be a ISO 639-1 letter code |
-| WHISPER_MODEL | 'whisper-1' | Default model used by OpenAI, can only be set if you are using a custom provider that supports it |
-| MAX_UPLOAD_MB | '24' | Size of audio file before it chunks it for upload/processing.  Gets around file size restrictions on OpenAI and Groq endpoints. |
+---
 
-# Caveats/Notes
-* Requires endpoint to support `verbose_json`
-* OpenAI's endpoint does not have a detect language equivalent, so we have to force it to what we want or it will default to return English.
+## Setup
+
+Configure in Bazarr exactly as you would a regular Whisper provider, pointing it at this bridge's address and port (default 9000).
+
+### Docker
+
+```bash
+docker pull mccloud/bazarr-openai-whisperbridge
+```
+
+```yaml
+services:
+  bazarr-openai-whisperbridge:
+    image: mccloud/bazarr-openai-whisperbridge
+    environment:
+      - OPENAI_API_KEY=your_key_here
+      - OPENAI_BASE_URL=https://api.groq.com/openai/v1  # omit for OpenAI
+      - WHISPER_MODEL=whisper-large-v3-turbo
+    ports:
+      - 9000:9000
+```
+
+### Standalone
+
+Requires Python 3.11+, ffmpeg in PATH, and the following packages:
+
+```bash
+pip install fastapi uvicorn python-multipart ffmpeg-python openai
+```
+
+Download `bazarr-openai-whisperbridge.py`, set your environment variables, and run:
+
+```bash
+python bazarr-openai-whisperbridge.py
+```
+
+---
+
+## Using with Groq
+
+Groq provides fast, free-tier Whisper inference as a drop-in replacement for OpenAI.
+
+1. Generate an API key at https://console.groq.com/keys
+2. Set these environment variables:
+
+```yaml
+- OPENAI_API_KEY=your_groq_key_here
+- OPENAI_BASE_URL=https://api.groq.com/openai/v1
+- WHISPER_MODEL=whisper-large-v3-turbo
+```
+
+**Model choice:**
+
+| Model | Speed | Accuracy | Best for |
+|---|---|---|---|
+| `whisper-large-v3-turbo` | Fast | Good | Most content — recommended default |
+| `whisper-large-v3` | Slower | Best | Difficult audio, heavy accents, multiple speakers |
+
+---
+
+## Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `OPENAI_API_KEY` | — | **Required.** API key for your provider |
+| `OPENAI_BASE_URL` | *(OpenAI)* | Custom provider endpoint. Omit to use OpenAI. Example: `https://api.groq.com/openai/v1` |
+| `WHISPER_MODEL` | `whisper-1` | Model name passed to the provider. Use `whisper-large-v3-turbo` for Groq |
+| `FORCE_DETECTED_LANGUAGE_TO` | `en` | Language code returned when Bazarr calls `/detect-language`. Must be an ISO 639-1 code |
+| `MAX_UPLOAD_MB` | `24` | File size limit in MB before audio is split into chunks, working around the 25 MB limit on OpenAI and Groq |
+| `OPUS_BITRATE_KBPS` | `24` | Bitrate for Opus encoding before upload. 24 kbps keeps a 2-hour film under 24 MB with good quality. Increase for difficult audio |
+| `MAX_LINE_LENGTH` | `42` | Maximum characters per subtitle line (Netflix guideline) |
+| `GAP_SPLIT_SECS` | `0.4` | Silence gap in seconds that triggers a new subtitle. Prevents subtitles from displaying during pauses |
+
+---
+
+## Notes
+
+- The provider must support `response_format=verbose_json` and `timestamp_granularities`
+- Subtitles follow Netflix-style formatting: max 42 characters per line, 2 lines max, punctuation-aware line breaks, and gap-based silence suppression
+- OpenAI's API has no language detection endpoint, so `/detect-language` returns `FORCE_DETECTED_LANGUAGE_TO` rather than analysing the audio
