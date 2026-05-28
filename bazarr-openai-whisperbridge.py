@@ -1,4 +1,4 @@
-version = '0.4'
+version = '0.5'
 
 import os
 import io
@@ -186,14 +186,27 @@ def split_into_chunks(opus_data: io.BytesIO, force: bool = False) -> list[tuple[
     )
 
     chunks = []
+    cumulative_offset = 0.0
     for i in range(num_chunks):
         start = i * chunk_duration
         # Give the last chunk a slightly generous duration so ffmpeg runs
         # to the natural end of the stream without clipping the final word.
         duration = chunk_duration if i < num_chunks - 1 else (total_duration - start + 1)
         chunk = extract_opus_chunk(opus_data, start_secs=start, duration_secs=duration)
-        print(f"  Chunk {i + 1}/{num_chunks}: start={start:.1f}s  size={chunk.getbuffer().nbytes / 1024 / 1024:.2f} MB")
-        chunks.append((chunk, start))
+
+        # Measure the actual duration of this chunk rather than using the
+        # calculated value. ffmpeg snaps cuts to frame boundaries (~20ms for
+        # Opus), so each chunk may be slightly shorter or longer than expected.
+        # Using the calculated offset would cause drift that compounds across
+        # chunks — later chunks would be visibly misaligned. Accumulating the
+        # measured durations keeps every chunk offset exactly correct.
+        actual_duration = get_opus_duration(chunk)
+        print(
+            f"  Chunk {i + 1}/{num_chunks}: offset={cumulative_offset:.3f}s  "
+            f"duration={actual_duration:.3f}s  size={chunk.getbuffer().nbytes / 1024 / 1024:.2f} MB"
+        )
+        chunks.append((chunk, cumulative_offset))
+        cumulative_offset += actual_duration
 
     return chunks
 
