@@ -166,26 +166,29 @@ def regroup_segments(segments: list[dict]) -> list[dict]:
 
     before = len(segments)
     try:
-        result = stable_whisper.WhisperResult({
-            "segments": [
-                {
-                    "start": seg["start"],
-                    "end":   seg["end"],
-                    "text":  seg["text"],
-                    "words": [
-                        {
-                            "word":        w.get("word", ""),
-                            "start":       w.get("start"),
-                            "end":         w.get("end"),
-                            "probability": w.get("score", 1.0),
-                        }
-                        for w in (seg.get("words") or [])
-                        if w.get("start") is not None and w.get("end") is not None
-                    ],
-                }
-                for seg in segments
-            ]
-        })
+        result = stable_whisper.WhisperResult(
+            {
+                "segments": [
+                    {
+                        "start": seg["start"],
+                        "end":   seg["end"],
+                        "text":  seg["text"],
+                        "words": [
+                            {
+                                "word":        w.get("word", ""),
+                                "start":       w.get("start"),
+                                "end":         w.get("end"),
+                                "probability": w.get("score", 1.0),
+                            }
+                            for w in (seg.get("words") or [])
+                            if w.get("start") is not None and w.get("end") is not None
+                        ],
+                    }
+                    for seg in segments
+                ]
+            },
+            check_sorted=False,
+        )
         result.regroup(regroup_arg)
         regrouped = [
             {"start": seg.start, "end": seg.end, "text": seg.text.strip()}
