@@ -86,6 +86,7 @@ def verbose_json_to_segments(response) -> list[dict]:
         and getattr(w, "end",   None) is not None
     ]
     if top_words:
+        top_words.sort(key=lambda w: w["start"])
         full_text = (getattr(response, "text", "") or "").strip()
         print(f"Using {len(top_words)} top-level words for regroup.")
         return [{
