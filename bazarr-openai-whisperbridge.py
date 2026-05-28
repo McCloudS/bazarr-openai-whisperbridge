@@ -1,4 +1,4 @@
-version = '0.9'
+version = '0.4'
 
 import os
 import io
@@ -86,6 +86,47 @@ def verbose_json_to_srt(response) -> str:
 # stable-ts refinement
 # ---------------------------------------------------------------------------
 
+def _detect_silence(
+    audio: "np.ndarray",
+    sample_rate: int = PCM_SAMPLE_RATE,
+    min_silence_ms: int = 300,
+    threshold: float = 0.02,
+) -> tuple:
+    """
+    Detect silence regions in a float32 audio array normalised to [-1, 1].
+    Returns (silent_starts, silent_ends) as float32 numpy arrays of seconds.
+
+    Uses 20ms RMS energy frames. Regions where RMS stays below `threshold`
+    for at least `min_silence_ms` are reported as silence.
+    """
+    frame_samples = int(sample_rate * 0.02)          # 20ms frames
+    min_frames    = max(1, min_silence_ms // 20)
+
+    n_frames = len(audio) // frame_samples
+    if n_frames == 0:
+        return np.array([]), np.array([])
+
+    frames = audio[: n_frames * frame_samples].reshape(n_frames, frame_samples)
+    rms    = np.sqrt(np.mean(frames ** 2, axis=1))
+    silent = rms < threshold
+
+    starts, ends = [], []
+    i = 0
+    while i < len(silent):
+        if silent[i]:
+            j = i + 1
+            while j < len(silent) and silent[j]:
+                j += 1
+            if j - i >= min_frames:
+                starts.append(i * 0.02)   # frame index → seconds
+                ends.append(j   * 0.02)
+            i = j
+        else:
+            i += 1
+
+    return np.array(starts, dtype=np.float32), np.array(ends, dtype=np.float32)
+
+
 def refine_segments(segments: list[dict], pcm_bytes: bytes) -> list[dict]:
     """
     Snap segment start/end boundaries to the nearest silence point in the
@@ -102,14 +143,19 @@ def refine_segments(segments: list[dict], pcm_bytes: bytes) -> list[dict]:
         return segments
 
     try:
+        audio = np.frombuffer(pcm_bytes, np.int16).astype(np.float32) / 32768.0
+        silent_starts, silent_ends = _detect_silence(audio)
+
         result = stable_whisper.WhisperResult({
             "segments": [
                 {"start": s["start"], "end": s["end"], "text": s["text"], "words": []}
                 for s in segments
             ]
         })
-        audio = np.frombuffer(pcm_bytes, np.int16).astype(np.float32) / 32768.0
-        result.suppress_silence(audio)
+
+        if len(silent_starts) > 0:
+            result.suppress_silence(silent_starts, silent_ends)
+
         return [
             {"start": seg.start, "end": seg.end, "text": seg.text}
             for seg in result.segments
