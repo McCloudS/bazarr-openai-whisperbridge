@@ -1,9 +1,8 @@
-version = '0.96'
+version = '0.97-stable-ts'
 
 import os
 import io
 import math
-import threading
 from fastapi import FastAPI, File, UploadFile, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from typing import Union
@@ -30,26 +29,24 @@ PCM_NUM_CHANNELS     = 1
 PCM_BITS_PER_SAMPLE  = 16
 PCM_BYTES_PER_SAMPLE = PCM_BITS_PER_SAMPLE // 8
 
+# Stable-ts regroup algorithm string.
+# Controls how word-level timestamps are grouped into subtitle segments.
+# Requires stable-ts-whisperless to be installed; skipped silently if not.
+#
+# Default mirrors subgen: clamp_max + split_by_length(84) + split_by_length(42).
+# Set to blank to use stable-ts's own default (punctuation + gap based).
+# See https://github.com/jianfch/stable-ts for the full string syntax.
+REGROUP_ALGO = os.getenv('REGROUP', 'cm_sl=84_sl=42++++++1')
+
 # ---------------------------------------------------------------------------
-# Optional WhisperX alignment
-# If whisperx is installed, word-level forced alignment is applied after the
-# API transcription, giving more accurate subtitle boundaries.
-# Install: pip install whisperx (also requires torch)
-# Models are downloaded on first use per language and cached in
-# ~/.cache/torch — mount a volume there to persist across container restarts.
+# Optional stable-ts import
+# pip install stable-ts-whisperless (also requires torch CPU)
 # ---------------------------------------------------------------------------
 try:
-    import whisperx
-    import numpy as np
-    _whisperx_available = True
+    import stable_whisper
+    _stable_ts_available = True
 except ImportError:
-    _whisperx_available = False
-
-# Per-language alignment model cache.
-# Models are loaded once and reused across requests.
-# Protected by _align_lock so concurrent requests don't trigger duplicate loads.
-_align_models: dict = {}
-_align_lock = threading.Lock()
+    _stable_ts_available = False
 
 
 # ---------------------------------------------------------------------------
@@ -65,10 +62,29 @@ def seconds_to_srt_timestamp(seconds: float) -> str:
 
 
 def verbose_json_to_segments(response) -> list[dict]:
-    return [
-        {"start": seg.start, "end": seg.end, "text": seg.text.strip()}
-        for seg in response.segments
-    ]
+    """
+    Extract segments from a verbose_json response, including word-level
+    timestamps when the provider returns them (Groq/OpenAI with
+    timestamp_granularities=["word"]).  Word data is used by stable-ts
+    regroup for natural subtitle boundaries.
+    """
+    segments = []
+    for seg in response.segments:
+        s = {"start": seg.start, "end": seg.end, "text": seg.text.strip()}
+        words = getattr(seg, "words", None)
+        if words:
+            s["words"] = [
+                {
+                    "word":  w.word,
+                    "start": w.start,
+                    "end":   w.end,
+                    "score": getattr(w, "probability", 1.0),
+                }
+                for w in words
+                if w.start is not None and w.end is not None
+            ]
+        segments.append(s)
+    return segments
 
 
 def segments_to_srt(segments: list[dict]) -> str:
@@ -83,77 +99,63 @@ def segments_to_srt(segments: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# WhisperX alignment
+# stable-ts regrouping
 # ---------------------------------------------------------------------------
 
-def _get_align_model(language_code: str):
+def regroup_segments(segments: list[dict]) -> list[dict]:
     """
-    Load and cache the wav2vec2 alignment model for a given language.
-    The first load downloads the model (~200-400 MB depending on language).
-    Subsequent calls return the cached model instantly.
+    Use stable-ts to regroup word-level timestamps into natural subtitle
+    segments using the REGROUP algorithm string.
+
+    Only runs when:
+      - stable-ts-whisperless is installed
+      - The segments contain word-level data (from timestamp_granularities)
+      - REGROUP is not set to an empty string
+
+    Falls back to the input segments on any error.
     """
-    if language_code not in _align_models:
-        with _align_lock:
-            if language_code not in _align_models:
-                print(f"Loading WhisperX alignment model for '{language_code}' ...")
-                model_a, metadata = whisperx.load_align_model(
-                    language_code=language_code,
-                    device="cpu",
-                )
-                _align_models[language_code] = (model_a, metadata)
-                print(f"Alignment model for '{language_code}' loaded and cached.")
-    return _align_models[language_code]
-
-
-def align_segments(
-    segments: list[dict],
-    pcm_bytes: bytes,
-    language_code: str,
-) -> list[dict]:
-    """
-    Apply WhisperX forced alignment to refine segment timestamps.
-
-    Uses a language-specific wav2vec2 phoneme model to match each word in the
-    transcript to its exact position in the audio. This is fundamentally more
-    accurate than silence detection — it actually reads the speech, not just
-    the quiet gaps.
-
-    The aligned segment boundaries (start of first word, end of last word) are
-    used for SRT output. Falls back to the original segments on any error,
-    including unsupported languages.
-    """
-    if not _whisperx_available or not segments:
+    if not _stable_ts_available:
         return segments
+
+    if not any(seg.get("words") for seg in segments):
+        return segments
+
+    if not REGROUP_ALGO:
+        regroup_arg = True   # use stable-ts default
+    else:
+        regroup_arg = REGROUP_ALGO
 
     try:
-        model_a, metadata = _get_align_model(language_code)
-        audio = np.frombuffer(pcm_bytes, np.int16).astype(np.float32) / 32768.0
-        result = whisperx.align(
-            segments,
-            model_a,
-            metadata,
-            audio,
-            device="cpu",
-            return_char_alignments=False,
-        )
-
-        refined = []
-        for seg in result["segments"]:
-            words = seg.get("words", [])
-            # Use the aligned word boundaries for tighter start/end times.
-            # Fall back to the original segment times if words are missing.
-            start = words[0]["start"]  if words and "start" in words[0]  else seg["start"]
-            end   = words[-1]["end"]   if words and "end"   in words[-1] else seg["end"]
-            refined.append({
-                "start": start,
-                "end":   end,
-                "text":  seg["text"].strip(),
-            })
-        return refined
-
+        result = stable_whisper.WhisperResult({
+            "segments": [
+                {
+                    "start": seg["start"],
+                    "end":   seg["end"],
+                    "text":  seg["text"],
+                    "words": [
+                        {
+                            "word":        w.get("word", ""),
+                            "start":       w.get("start"),
+                            "end":         w.get("end"),
+                            "probability": w.get("score", 1.0),
+                        }
+                        for w in seg.get("words", [])
+                    ],
+                }
+                for seg in segments
+            ]
+        })
+        result.regroup(regroup_arg)
+        return [
+            {"start": seg.start, "end": seg.end, "text": seg.text.strip()}
+            for seg in result.segments
+        ]
     except Exception as exc:
-        print(f"WhisperX alignment failed ({exc}) — using unaligned segments.")
-        return segments
+        print(f"stable-ts regroup failed ({exc}) — using original segments.")
+        return [
+            {"start": s["start"], "end": s["end"], "text": s["text"]}
+            for s in segments
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -227,26 +229,27 @@ def split_pcm_into_chunks(pcm_bytes: bytes, num_chunks: int) -> list[tuple[bytes
 # Core transcription
 # ---------------------------------------------------------------------------
 
-def _call_api(opus: io.BytesIO, task: str, language: str | None) -> tuple[list[dict], str]:
+def _call_api(opus: io.BytesIO, task: str, language: str | None) -> list[dict]:
     """
-    Call the provider with verbose_json.
-    Returns (segments, detected_language) — the detected language is used by
-    the WhisperX alignment model loader to pick the correct wav2vec2 model.
-    For translations the output is always English, so we return 'en'.
+    Call the provider with verbose_json + word-level timestamps.
+    Returns segments including word data when the provider supports it.
     """
     opus.seek(0)
     if task == "transcribe":
         response = client.audio.transcriptions.create(
-            model=whisper_model, file=opus, response_format="verbose_json", language=language,
+            model=whisper_model,
+            file=opus,
+            response_format="verbose_json",
+            language=language,
+            timestamp_granularities=["word"],
         )
-        detected_language = getattr(response, "language", None) or language or "en"
     else:
         response = client.audio.translations.create(
-            model=whisper_model, file=opus, response_format="verbose_json",
+            model=whisper_model,
+            file=opus,
+            response_format="verbose_json",
         )
-        detected_language = "en"  # translations are always English
-
-    return verbose_json_to_segments(response), detected_language
+    return verbose_json_to_segments(response)
 
 
 def _transcribe_pcm_chunks(
@@ -254,19 +257,12 @@ def _transcribe_pcm_chunks(
     task: str,
     language: str | None,
 ) -> str:
-    """
-    Encode each PCM chunk to Opus, transcribe, align (if WhisperX available),
-    apply sample-accurate offset, and merge into one SRT.
-
-    Alignment runs against each chunk's own PCM audio while timestamps are
-    still chunk-relative (before the offset is added), so the wav2vec2 model
-    is always working against the correct audio window.
-    """
+    """Encode each PCM chunk, transcribe, regroup, apply offset, merge to SRT."""
     all_segments: list[dict] = []
     for idx, (pcm_chunk, start_offset) in enumerate(pcm_chunks, start=1):
         print(f"Transcribing chunk {idx}/{len(pcm_chunks)} (offset={start_offset:.3f}s) ...")
-        segs, detected_language = _call_api(encode_pcm_to_opus(pcm_chunk), task, language)
-        segs = align_segments(segs, pcm_chunk, detected_language)
+        segs = _call_api(encode_pcm_to_opus(pcm_chunk), task, language)
+        segs = regroup_segments(segs)
         for seg in segs:
             seg["start"] += start_offset
             seg["end"]   += start_offset
@@ -275,15 +271,6 @@ def _transcribe_pcm_chunks(
 
 
 def call_transcription(pcm_bytes: bytes, task: str, language: str | None) -> str:
-    """
-    Transcribe audio and return an SRT string.
-
-      1. Encode to Opus  — check the actual output size.
-      2. Fits?           — single API call, then align.
-      3. Too large?      — split PCM, encode each chunk, transcribe, align,
-                           apply sample-accurate offset, merge.
-      4. 413 fallback    — force-split and retry.
-    """
     opus      = encode_pcm_to_opus(pcm_bytes)
     opus_size = opus.getbuffer().nbytes
     print(
@@ -294,8 +281,8 @@ def call_transcription(pcm_bytes: bytes, task: str, language: str | None) -> str
 
     if opus_size <= MAX_UPLOAD_BYTES:
         try:
-            segs, detected_language = _call_api(opus, task, language)
-            segs = align_segments(segs, pcm_bytes, detected_language)
+            segs = _call_api(opus, task, language)
+            segs = regroup_segments(segs)
             return segments_to_srt(segs)
         except Exception as exc:
             if not is_too_large_error(exc):
@@ -368,12 +355,12 @@ def asr(
 
 
 if __name__ == "__main__":
-    whisperx_status = "whisperx active" if _whisperx_available else "whisperx not installed"
+    regroup_status = f"regroup: {REGROUP_ALGO or 'stable-ts default'}" if _stable_ts_available else "stable-ts not installed"
     print(
         f"Running Bazarr to OpenAI Whisper Bridge ({docker_status}) v{version} | "
         f"model: {whisper_model} | "
         f"opus: {OPUS_BITRATE_BPS // 1000} kbps | "
         f"max upload: {MAX_UPLOAD_BYTES // 1024 // 1024} MB | "
-        f"{whisperx_status}"
+        f"{regroup_status}"
     )
     uvicorn.run(app, host="0.0.0.0", port=9000)
