@@ -3,6 +3,7 @@ version = '0.99'
 import os
 import io
 import math
+import re
 import traceback
 from fastapi import FastAPI, File, UploadFile, Query, HTTPException
 from fastapi.responses import StreamingResponse
@@ -25,14 +26,25 @@ MAX_UPLOAD_BYTES = int(os.getenv('MAX_UPLOAD_MB', '24')) * 1024 * 1024
 OPUS_BITRATE_BPS = int(os.getenv('OPUS_BITRATE_KBPS', '24')) * 1000
 OPUS_APPLICATION = "audio"
 
-# Maximum characters per subtitle line. Lines longer than this are split at
-# the nearest word boundary using the word-level timestamps from the API.
-MAX_LINE_LENGTH  = int(os.getenv('MAX_LINE_LENGTH', '42'))
+# Netflix subtitle guidelines
+MAX_LINE_LENGTH = int(os.getenv('MAX_LINE_LENGTH', '42'))  # chars per line
+MAX_LINES       = 2                                         # lines per subtitle
+# Start a new subtitle after a silence gap of this many seconds.
+# Handles silence suppression — subtitle won't bleed into pauses.
+GAP_SPLIT_SECS  = float(os.getenv('GAP_SPLIT_SECS', '0.4'))
 
 PCM_SAMPLE_RATE      = 16000
 PCM_NUM_CHANNELS     = 1
 PCM_BITS_PER_SAMPLE  = 16
 PCM_BYTES_PER_SAMPLE = PCM_BITS_PER_SAMPLE // 8
+
+# Punctuation patterns for split decisions
+_SENTENCE_END = re.compile(r'[.!?][\'")\]]*$')   # strong break after
+_SOFT_BREAK   = re.compile(r'[,;:]$')             # weak break after
+_CONJUNCTIONS = frozenset({
+    'and', 'but', 'or', 'so', 'yet', 'for', 'nor',
+    'as', 'if', 'when', 'then', 'because', 'although',
+})
 
 
 # ---------------------------------------------------------------------------
@@ -47,19 +59,142 @@ def seconds_to_srt_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
+def segments_to_srt(segments: list[dict]) -> str:
+    lines = []
+    for i, seg in enumerate(segments, start=1):
+        lines.append(
+            f"{i}\n"
+            f"{seconds_to_srt_timestamp(seg['start'])} --> {seconds_to_srt_timestamp(seg['end'])}\n"
+            f"{seg['text']}\n"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Netflix-style subtitle segmentation
+# ---------------------------------------------------------------------------
+
+def split_segments(words: list[dict]) -> list[dict]:
+    """
+    Convert a flat word list into subtitle segments following Netflix guidelines:
+      - Max MAX_LINE_LENGTH characters per line
+      - Max MAX_LINES lines per subtitle (2)
+      - New subtitle after GAP_SPLIT_SECS silence (handles silence suppression)
+      - New subtitle after sentence-ending punctuation
+      - 2-line subtitles split at the most natural word boundary
+      - Lines balanced in length; prefer breaking after punctuation,
+        avoid breaking before conjunctions
+    """
+    if not words:
+        return []
+
+    segments: list[dict]       = []
+    current: list[dict]        = []
+    max_chars = MAX_LINE_LENGTH * MAX_LINES
+
+    def flush():
+        if current:
+            segments.append(_format_subtitle(current))
+            current.clear()
+
+    for i, word in enumerate(words):
+        # --- gap-based split (silence suppression) ---
+        if current:
+            gap = word["start"] - current[-1]["end"]
+            if gap >= GAP_SPLIT_SECS:
+                flush()
+
+        # --- would exceed max subtitle length? ---
+        candidate = " ".join(w["word"] for w in current) + (" " if current else "") + word["word"]
+        if current and len(candidate) > max_chars:
+            flush()
+
+        current.append(word)
+
+        # --- sentence-end split (only if subtitle is long enough to be worth it) ---
+        text_so_far = " ".join(w["word"] for w in current)
+        if _SENTENCE_END.search(word["word"]) and len(text_so_far) >= MAX_LINE_LENGTH // 2:
+            flush()
+
+    flush()
+    return segments
+
+
+def _format_subtitle(words: list[dict]) -> dict:
+    """
+    Format a word group as a 1- or 2-line subtitle dict.
+    For 2-line subtitles, find the most natural split point:
+      - Prefer after punctuation near the middle
+      - Avoid breaking before conjunctions
+      - Aim for balanced line lengths
+    """
+    text = " ".join(w["word"] for w in words)
+    start = words[0]["start"]
+    end   = words[-1]["end"]
+
+    if len(text) <= MAX_LINE_LENGTH:
+        return {"start": start, "end": end, "text": text}
+
+    # Find best split point for 2 lines
+    best_idx   = _find_line_split(words)
+    line1 = " ".join(w["word"] for w in words[:best_idx])
+    line2 = " ".join(w["word"] for w in words[best_idx:])
+
+    # Safety: if either line still exceeds the limit, fall back to single block
+    if len(line1) > MAX_LINE_LENGTH or len(line2) > MAX_LINE_LENGTH:
+        return {"start": start, "end": end, "text": text}
+
+    return {"start": start, "end": end, "text": f"{line1}\n{line2}"}
+
+
+def _find_line_split(words: list[dict]) -> int:
+    """
+    Return the word index at which to split words into two balanced lines.
+
+    Scoring (lower = better split):
+      - Penalise imbalance between line lengths
+      - Reward splitting after sentence-end or soft punctuation
+      - Penalise splitting before a conjunction
+    """
+    texts = [w["word"] for w in words]
+    n     = len(texts)
+
+    best_idx   = max(1, n // 2)
+    best_score = float("inf")
+
+    for i in range(1, n):
+        line1 = " ".join(texts[:i])
+        line2 = " ".join(texts[i:])
+
+        if len(line1) > MAX_LINE_LENGTH or len(line2) > MAX_LINE_LENGTH:
+            continue
+
+        balance      = abs(len(line1) - len(line2))
+        punct_bonus  = -8 if _SENTENCE_END.search(texts[i - 1]) else \
+                       -4 if _SOFT_BREAK.search(texts[i - 1]) else 0
+        conj_penalty =  6 if texts[i].lower().rstrip(".,!?;:") in _CONJUNCTIONS else 0
+
+        score = balance + punct_bonus + conj_penalty
+        if score < best_score:
+            best_score = score
+            best_idx   = i
+
+    return best_idx
+
+
+# ---------------------------------------------------------------------------
+# Response parsing
+# ---------------------------------------------------------------------------
+
 def verbose_json_to_segments(response) -> list[dict]:
     """
-    Extract segments from a verbose_json response.
+    Extract and segment the API response into subtitle-ready dicts.
 
-    Handles two provider formats:
-      - Groq:   words in a top-level response.words array
-      - OpenAI: words nested inside each segment object
-
-    When top-level words are present we ignore the provider's segment
-    boundaries and rebuild segments ourselves using split_segments(), giving
-    us precise word-boundary splits at the desired line length.
+    Groq returns words at the top level; OpenAI nests them in segments.
+    Either way we pass the word list through split_segments() so line
+    length, gap splitting, and punctuation-aware breaks are applied uniformly.
     """
-    # --- Groq: top-level words array ---
+    # --- Groq: top-level words ---
     top_words = [
         {
             "word":  getattr(w, "word",  "").strip(),
@@ -72,7 +207,7 @@ def verbose_json_to_segments(response) -> list[dict]:
     ]
     if top_words:
         top_words.sort(key=lambda w: w["start"])
-        print(f"Using {len(top_words)} top-level words — splitting into segments.")
+        print(f"Using {len(top_words)} top-level words.")
         return split_segments(top_words)
 
     # --- OpenAI: segment-nested words ---
@@ -99,58 +234,6 @@ def verbose_json_to_segments(response) -> list[dict]:
         else:
             segments.append({"start": start, "end": end, "text": text})
     return segments
-
-
-def split_segments(words: list[dict]) -> list[dict]:
-    """
-    Group a flat list of word dicts into subtitle segments, splitting when
-    the accumulated line would exceed MAX_LINE_LENGTH characters.
-
-    Each segment's start/end is taken directly from the word timestamps so
-    the subtitle appears exactly when the first word is spoken and disappears
-    when the last word ends — no padding, no silence bleed.
-    """
-    segments = []
-    current_words: list[dict] = []
-    current_len = 0
-
-    for word in words:
-        w_text = word["word"]
-        # +1 for the space between words (except the first word)
-        added = len(w_text) + (1 if current_words else 0)
-
-        if current_words and current_len + added > MAX_LINE_LENGTH:
-            # Flush current segment
-            segments.append(_words_to_segment(current_words))
-            current_words = [word]
-            current_len   = len(w_text)
-        else:
-            current_words.append(word)
-            current_len += added
-
-    if current_words:
-        segments.append(_words_to_segment(current_words))
-
-    return segments
-
-
-def _words_to_segment(words: list[dict]) -> dict:
-    return {
-        "start": words[0]["start"],
-        "end":   words[-1]["end"],
-        "text":  " ".join(w["word"] for w in words),
-    }
-
-
-def segments_to_srt(segments: list[dict]) -> str:
-    lines = []
-    for i, seg in enumerate(segments, start=1):
-        lines.append(
-            f"{i}\n"
-            f"{seconds_to_srt_timestamp(seg['start'])} --> {seconds_to_srt_timestamp(seg['end'])}\n"
-            f"{seg['text']}\n"
-        )
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +284,6 @@ def encode_pcm_to_opus(pcm_bytes: bytes) -> io.BytesIO:
 # ---------------------------------------------------------------------------
 
 def split_pcm_into_chunks(pcm_bytes: bytes, num_chunks: int) -> list[tuple[bytes, float]]:
-    """Split raw PCM into num_chunks equal pieces with sample-accurate offsets."""
     total_samples     = len(pcm_bytes) // PCM_BYTES_PER_SAMPLE
     total_duration    = total_samples / PCM_SAMPLE_RATE
     samples_per_chunk = math.ceil(total_samples / num_chunks)
@@ -229,7 +311,6 @@ def split_pcm_into_chunks(pcm_bytes: bytes, num_chunks: int) -> list[tuple[bytes
 # ---------------------------------------------------------------------------
 
 def _call_api(opus: io.BytesIO, task: str, language: str | None) -> list[dict]:
-    """Call the provider with verbose_json + word timestamps. Returns segments."""
     opus.seek(0)
     if task == "transcribe":
         response = client.audio.transcriptions.create(
@@ -253,7 +334,6 @@ def _transcribe_pcm_chunks(
     task: str,
     language: str | None,
 ) -> str:
-    """Encode each PCM chunk, transcribe, apply sample-accurate offset, merge to SRT."""
     all_segments: list[dict] = []
     for idx, (pcm_chunk, start_offset) in enumerate(pcm_chunks, start=1):
         print(f"Transcribing chunk {idx}/{len(pcm_chunks)} (offset={start_offset:.3f}s) ...")
@@ -353,6 +433,7 @@ if __name__ == "__main__":
         f"model: {whisper_model} | "
         f"opus: {OPUS_BITRATE_BPS // 1000} kbps | "
         f"max upload: {MAX_UPLOAD_BYTES // 1024 // 1024} MB | "
-        f"max line: {MAX_LINE_LENGTH} chars"
+        f"max line: {MAX_LINE_LENGTH} chars | "
+        f"gap split: {GAP_SPLIT_SECS}s"
     )
     uvicorn.run(app, host="0.0.0.0", port=9000)
