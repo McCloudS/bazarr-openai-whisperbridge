@@ -21,6 +21,7 @@ client = OpenAI()
 
 force_detected_language_to = os.getenv('FORCE_DETECTED_LANGUAGE_TO', 'en')
 whisper_model = os.getenv('WHISPER_MODEL', 'whisper-1')
+whisper_translate_model = os.getenv('WHISPER_TRANSLATE_MODEL', whisper_model)
 
 MAX_UPLOAD_BYTES = int(os.getenv('MAX_UPLOAD_MB', '24')) * 1024 * 1024
 OPUS_BITRATE_BPS = int(os.getenv('OPUS_BITRATE_KBPS', '24')) * 1000
@@ -373,7 +374,7 @@ def _call_api(opus: io.BytesIO, task: str, language: str | None) -> list[dict]:
         )
     else:
         response = client.audio.translations.create(
-            model=whisper_model,
+            model=whisper_translate_model,
             file=opus,
             response_format="verbose_json",
         )
@@ -482,9 +483,14 @@ def asr(
 
 
 if __name__ == "__main__":
+    model_info = (
+        f"model: {whisper_model} | translate model: {whisper_translate_model}"
+        if whisper_translate_model != whisper_model
+        else f"model: {whisper_model}"
+    )
     print(
         f"Running Bazarr to OpenAI Whisper Bridge ({docker_status}) v{version} | "
-        f"model: {whisper_model} | "
+        f"{model_info} | "
         f"opus: {OPUS_BITRATE_BPS // 1000} kbps | "
         f"max upload: {MAX_UPLOAD_BYTES // 1024 // 1024} MB | "
         f"max line: {MAX_LINE_LENGTH} chars | "

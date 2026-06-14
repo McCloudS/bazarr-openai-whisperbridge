@@ -75,6 +75,7 @@ Groq provides fast, free-tier Whisper inference as a drop-in replacement for Ope
 | `OPENAI_API_KEY` | — | **Required.** API key for your provider |
 | `OPENAI_BASE_URL` | *(OpenAI)* | Custom provider endpoint. Omit to use OpenAI. Example: `https://api.groq.com/openai/v1` |
 | `WHISPER_MODEL` | `whisper-1` | Model name passed to the provider. Use `whisper-large-v3-turbo` for Groq |
+| `WHISPER_TRANSLATE_MODEL` | *(same as `WHISPER_MODEL`)* | Model used for translate tasks only. Set to `whisper-large-v3` to use the cheaper turbo model for transcription while keeping full v3 accuracy for translation |
 | `FORCE_DETECTED_LANGUAGE_TO` | `en` | Language code returned when Bazarr calls `/detect-language`. Must be an ISO 639-1 code |
 | `MAX_UPLOAD_MB` | `24` | File size limit in MB before audio is split into chunks, working around the 25 MB limit on OpenAI and Groq |
 | `OPUS_BITRATE_KBPS` | `24` | Bitrate for Opus encoding before upload. 24 kbps keeps a 2-hour film under 24 MB with good quality. Increase for difficult audio |
