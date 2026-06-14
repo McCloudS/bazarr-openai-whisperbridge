@@ -1,4 +1,4 @@
-version = '0.99'
+version = '1.0'
 
 import os
 import io
@@ -32,6 +32,13 @@ MAX_LINES       = 2                                         # lines per subtitle
 # Start a new subtitle after a silence gap of this many seconds.
 # Handles silence suppression — subtitle won't bleed into pauses.
 GAP_SPLIT_SECS  = float(os.getenv('GAP_SPLIT_SECS', '0.4'))
+
+# Phantom-segment filter (issue #3 — Groq/Whisper hallucination at t≈0)
+# Drop any segment whose start is within this many seconds of 0, whose
+# duration is shorter than the duration threshold, and whose text is a
+# duplicate of a later entry.  Set PHANTOM_START_MAX_SECS=0 to disable.
+PHANTOM_START_MAX_SECS    = float(os.getenv('PHANTOM_START_MAX_SECS',    '1.0'))
+PHANTOM_DURATION_MAX_SECS = float(os.getenv('PHANTOM_DURATION_MAX_SECS', '2.0'))
 
 PCM_SAMPLE_RATE      = 16000
 PCM_NUM_CHANNELS     = 1
@@ -68,6 +75,50 @@ def segments_to_srt(segments: list[dict]) -> str:
             f"{seg['text']}\n"
         )
     return "\n".join(lines)
+
+
+def filter_phantom_segments(segments: list[dict]) -> list[dict]:
+    """
+    Strip Whisper hallucination entries near timestamp 0 (issue #3).
+
+    Groq (and occasionally OpenAI) emits two kinds of spurious near-zero
+    segments:
+      1. Duplicate text — same text appears again in a real later entry.
+      2. Content-free — text contains no word characters (e.g. a lone ".").
+
+    A segment is dropped when ALL of these hold:
+      - start < PHANTOM_START_MAX_SECS
+      - duration < PHANTOM_DURATION_MAX_SECS
+      - text is a duplicate of a later entry OR contains no word characters
+
+    A legitimate opening subtitle that is short but has unique, readable
+    content is kept.  Set PHANTOM_START_MAX_SECS=0 to disable entirely.
+    """
+    if not segments or PHANTOM_START_MAX_SECS <= 0:
+        return segments
+
+    later_texts = {s["text"].strip().lower() for s in segments[1:]}
+    result = []
+    for seg in segments:
+        duration = seg["end"] - seg["start"]
+        text_stripped = seg["text"].strip()
+        is_phantom_text = (
+            text_stripped.lower() in later_texts          # duplicate of later entry
+            or not re.search(r'\w', text_stripped)        # no real word chars (e.g. ".")
+        )
+        if (
+            seg["start"] < PHANTOM_START_MAX_SECS
+            and duration < PHANTOM_DURATION_MAX_SECS
+            and is_phantom_text
+        ):
+            print(
+                f"Filtered phantom segment at "
+                f"{seconds_to_srt_timestamp(seg['start'])}: "
+                f'"{text_stripped}"'
+            )
+            continue
+        result.append(seg)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -337,12 +388,15 @@ def _transcribe_pcm_chunks(
     all_segments: list[dict] = []
     for idx, (pcm_chunk, start_offset) in enumerate(pcm_chunks, start=1):
         print(f"Transcribing chunk {idx}/{len(pcm_chunks)} (offset={start_offset:.3f}s) ...")
-        segs = _call_api(encode_pcm_to_opus(pcm_chunk), task, language)
+        # Filter per-chunk before adding the offset so that a hallucinated
+        # t=0 phantom on chunk N (which would shift to the chunk boundary
+        # timestamp) is caught while it still looks like t=0.
+        segs = filter_phantom_segments(_call_api(encode_pcm_to_opus(pcm_chunk), task, language))
         for seg in segs:
             seg["start"] += start_offset
             seg["end"]   += start_offset
         all_segments.extend(segs)
-    return segments_to_srt(all_segments)
+    return segments_to_srt(filter_phantom_segments(all_segments))
 
 
 def call_transcription(pcm_bytes: bytes, task: str, language: str | None) -> str:
@@ -356,7 +410,7 @@ def call_transcription(pcm_bytes: bytes, task: str, language: str | None) -> str
 
     if opus_size <= MAX_UPLOAD_BYTES:
         try:
-            return segments_to_srt(_call_api(opus, task, language))
+            return segments_to_srt(filter_phantom_segments(_call_api(opus, task, language)))
         except Exception as exc:
             if not is_too_large_error(exc):
                 raise
