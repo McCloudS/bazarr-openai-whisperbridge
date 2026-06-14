@@ -64,6 +64,8 @@ Groq provides fast, free-tier Whisper inference as a drop-in replacement for Ope
 | `whisper-large-v3-turbo` | Fast | Good | Most content — recommended default |
 | `whisper-large-v3` | Slower | Best | Difficult audio, heavy accents, multiple speakers |
 
+> **Note:** `whisper-large-v3-turbo` does **not** support the `translate` task on Groq — you'll get a 400 error if Bazarr requests translation with that model. Switch to `whisper-large-v3` if you need translation.
+
 ---
 
 ## Configuration
@@ -73,11 +75,14 @@ Groq provides fast, free-tier Whisper inference as a drop-in replacement for Ope
 | `OPENAI_API_KEY` | — | **Required.** API key for your provider |
 | `OPENAI_BASE_URL` | *(OpenAI)* | Custom provider endpoint. Omit to use OpenAI. Example: `https://api.groq.com/openai/v1` |
 | `WHISPER_MODEL` | `whisper-1` | Model name passed to the provider. Use `whisper-large-v3-turbo` for Groq |
+| `WHISPER_TRANSLATE_MODEL` | *(same as `WHISPER_MODEL`)* | Model used for translate tasks only. Set to `whisper-large-v3` to use the cheaper turbo model for transcription while keeping full v3 accuracy for translation |
 | `FORCE_DETECTED_LANGUAGE_TO` | `en` | Language code returned when Bazarr calls `/detect-language`. Must be an ISO 639-1 code |
 | `MAX_UPLOAD_MB` | `24` | File size limit in MB before audio is split into chunks, working around the 25 MB limit on OpenAI and Groq |
 | `OPUS_BITRATE_KBPS` | `24` | Bitrate for Opus encoding before upload. 24 kbps keeps a 2-hour film under 24 MB with good quality. Increase for difficult audio |
 | `MAX_LINE_LENGTH` | `42` | Maximum characters per subtitle line (Netflix guideline) |
 | `GAP_SPLIT_SECS` | `0.4` | Silence gap in seconds that triggers a new subtitle. Prevents subtitles from displaying during pauses |
+| `PHANTOM_START_MAX_SECS` | `1.0` | Filter phantom hallucination entries: drop any entry whose start time is within this many seconds of 0. Set to `0` to disable |
+| `PHANTOM_DURATION_MAX_SECS` | `2.0` | Maximum duration (seconds) for a near-zero entry to be considered a phantom. Only takes effect alongside `PHANTOM_START_MAX_SECS` |
 
 ---
 
